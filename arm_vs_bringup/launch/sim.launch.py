@@ -1,5 +1,6 @@
 from launch import LaunchDescription
-from launch.actions import IncludeLaunchDescription, RegisterEventHandler
+from launch.actions import (AppendEnvironmentVariable, IncludeLaunchDescription,
+                            RegisterEventHandler)
 from launch.event_handlers import OnProcessExit
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import Command, PathJoinSubstitution
@@ -14,41 +15,47 @@ def generate_launch_description():
 
     xacro_file = PathJoinSubstitution([description_pkg, 'urdf', 'panda.urdf.xacro'])
     controllers_file = PathJoinSubstitution([bringup_pkg, 'config', 'controllers.yaml'])
+    world_file = PathJoinSubstitution([bringup_pkg, 'worlds', 'vs_world.sdf'])
+    rviz_config = PathJoinSubstitution([bringup_pkg, 'rviz', 'sim.rviz'])
 
-    # 1. Build the robot model and pass the controllers file into it
     robot_description = ParameterValue(
         Command(['xacro ', xacro_file, ' controllers_file:=', controllers_file]),
         value_type=str)
 
-    # 2. Start Gazebo with an empty world
+    # 1. Tell Gazebo where our models are, so model://aruco_cube can be found
+    model_path = AppendEnvironmentVariable(
+        'GZ_SIM_RESOURCE_PATH', PathJoinSubstitution([bringup_pkg, 'models']))
+
+    # 2. Start Gazebo with our world
     gazebo = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             PathJoinSubstitution([FindPackageShare('ros_gz_sim'), 'launch', 'gz_sim.launch.py'])),
-        launch_arguments={'gz_args': '-r empty.sdf'}.items(),
+        launch_arguments={'gz_args': ['-r ', world_file]}.items(),
     )
 
-    # 3. Publish the robot model and TF
     robot_state_publisher = Node(
         package='robot_state_publisher',
         executable='robot_state_publisher',
         parameters=[{'robot_description': robot_description, 'use_sim_time': True}],
     )
 
-    # 4. Put the robot into Gazebo
     spawn_robot = Node(
         package='ros_gz_sim',
         executable='create',
         arguments=['-topic', 'robot_description', '-name', 'panda'],
     )
 
-    # 5. Bring the simulation clock into ROS
-    clock_bridge = Node(
+    # 3. Bridge: clock, camera image and camera info from Gazebo to ROS
+    bridge = Node(
         package='ros_gz_bridge',
         executable='parameter_bridge',
-        arguments=['/clock@rosgraph_msgs/msg/Clock[gz.msgs.Clock'],
+        arguments=[
+            '/clock@rosgraph_msgs/msg/Clock[gz.msgs.Clock',
+            '/wrist_camera/image@sensor_msgs/msg/Image[gz.msgs.Image',
+            '/wrist_camera/camera_info@sensor_msgs/msg/CameraInfo[gz.msgs.CameraInfo',
+        ],
     )
 
-    # 6. Start the controllers
     joint_state_broadcaster = Node(
         package='controller_manager',
         executable='spawner',
@@ -65,15 +72,24 @@ def generate_launch_description():
         arguments=['velocity_controller', '--inactive'],
     )
 
-    # Controllers can only start after the robot is in Gazebo
     start_controllers = RegisterEventHandler(
         OnProcessExit(target_action=spawn_robot,
                       on_exit=[joint_state_broadcaster, arm_controller, velocity_controller]))
 
+    # 4. RViz for debugging
+    rviz = Node(
+        package='rviz2',
+        executable='rviz2',
+        arguments=['-d', rviz_config],
+        parameters=[{'use_sim_time': True}],
+    )
+
     return LaunchDescription([
+        model_path,
         gazebo,
         robot_state_publisher,
-        clock_bridge,
+        bridge,
         spawn_robot,
         start_controllers,
+        rviz,
     ])

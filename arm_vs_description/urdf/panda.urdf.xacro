@@ -3,14 +3,65 @@
 
   <xacro:arg name="controllers_file" default=""/>
 
+  <!-- 1. Panda model with masses and inertias -->
   <xacro:include filename="$(find moveit_resources_panda_description)/urdf/panda.urdf.xacro"/>
 
+  <!-- 2. Fix the robot base to the world -->
   <link name="world"/>
   <joint name="world_joint" type="fixed">
     <parent link="world"/>
     <child link="panda_link0"/>
   </joint>
 
+  <!-- 3. Wrist camera: mounted on the hand, looking along the fingers -->
+  <link name="camera_link">
+    <visual>
+      <geometry><box size="0.02 0.04 0.02"/></geometry>
+      <material name="camera_black"><color rgba="0.1 0.1 0.1 1"/></material>
+    </visual>
+    <inertial>
+      <mass value="0.01"/>
+      <inertia ixx="1e-6" iyy="1e-6" izz="1e-6" ixy="0" ixz="0" iyz="0"/>
+    </inertial>
+  </link>
+  <joint name="camera_joint" type="fixed">
+    <parent link="panda_hand"/>
+    <child link="camera_link"/>
+    <origin xyz="0.06 0 0.04" rpy="0 -1.5708 0"/>
+  </joint>
+
+  <!-- Optical frame: z forward, x right, y down (ROS / OpenCV convention) -->
+  <link name="camera_optical_frame"/>
+  <joint name="camera_optical_joint" type="fixed">
+    <parent link="camera_link"/>
+    <child link="camera_optical_frame"/>
+    <origin xyz="0 0 0" rpy="-1.5708 0 -1.5708"/>
+  </joint>
+
+  <gazebo reference="camera_link">
+    <sensor name="wrist_camera" type="camera">
+      <always_on>true</always_on>
+      <update_rate>30</update_rate>
+      <visualize>true</visualize>
+      <topic>/wrist_camera/image</topic>
+      <gz_frame_id>camera_optical_frame</gz_frame_id>
+      <camera>
+        <camera_info_topic>/wrist_camera/camera_info</camera_info_topic>
+        <horizontal_fov>1.047</horizontal_fov>
+        <image>
+          <width>640</width>
+          <height>480</height>
+          <format>R8G8B8</format>
+        </image>
+        <clip>
+          <near>0.01</near>
+          <far>5.0</far>
+        </clip>
+      </camera>
+    </sensor>
+  </gazebo>
+
+  <!-- 4. ros2_control joints -->
   <xacro:macro name="arm_joint" params="name initial">
     <joint name="${name}">
       <command_interface name="position"/>
@@ -35,6 +86,7 @@
     <xacro:arm_joint name="panda_joint7" initial="0.785"/>
   </ros2_control>
 
+  <!-- 5. Plugin that connects ros2_control to Gazebo -->
   <gazebo>
     <plugin filename="gz_ros2_control-system" name="gz_ros2_control::GazeboSimROS2ControlPlugin">
       <parameters>$(arg controllers_file)</parameters>
