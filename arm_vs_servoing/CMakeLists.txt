@@ -26,7 +26,12 @@ ament_target_dependencies(pick_cube
   rclcpp geometry_msgs std_msgs sensor_msgs tf2 tf2_ros tf2_eigen)
 target_link_libraries(pick_cube Eigen3::Eigen)
 
-install(TARGETS visual_servo pick_cube
+add_executable(pick_and_place src/pick_and_place.cpp)
+ament_target_dependencies(pick_and_place
+  rclcpp geometry_msgs std_msgs sensor_msgs tf2 tf2_ros tf2_eigen)
+target_link_libraries(pick_and_place Eigen3::Eigen)
+
+install(TARGETS visual_servo pick_cube pick_and_place
   DESTINATION lib/${PROJECT_NAME})
 
 install(DIRECTORY launch

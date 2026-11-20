@@ -12,22 +12,36 @@ def generate_launch_description():
         output='screen',
     )
 
-    # 2. Marker detection (day 8)
-    marker_detector = Node(
+    # 2. Marker 0: the cube
+    cube_detector = Node(
         package='arm_vs_perception',
         executable='marker_detector',
-        parameters=[{'use_sim_time': True}],
+        name='cube_marker_detector',
+        parameters=[{'use_sim_time': True, 'marker_id': 0}],
         output='screen',
     )
 
-    # 3. Cartesian velocity control (day 6)
+    # 3. Marker 1: the place location, same program with other topic names
+    place_detector = Node(
+        package='arm_vs_perception',
+        executable='marker_detector',
+        name='place_marker_detector',
+        parameters=[{'use_sim_time': True, 'marker_id': 1}],
+        remappings=[
+            ('/marker_pose', '/place_marker_pose'),
+            ('/marker_debug_image', '/place_debug_image'),
+        ],
+        output='screen',
+    )
+
+    # 4. Cartesian velocity control
     cartesian_velocity = Node(
         package='arm_vs_control',
         executable='cartesian_velocity_node',
         output='screen',
     )
 
-    # 4. Visual servoing (today)
+    # 5. Visual servoing
     visual_servo = Node(
         package='arm_vs_servoing',
         executable='visual_servo',
@@ -37,7 +51,8 @@ def generate_launch_description():
 
     return LaunchDescription([
         switch_controllers,
-        marker_detector,
+        cube_detector,
+        place_detector,
         cartesian_velocity,
         visual_servo,
     ])
