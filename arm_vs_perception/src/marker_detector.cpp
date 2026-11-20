@@ -1,3 +1,4 @@
+#include <cstdio>
 #include <memory>
 #include <string>
 #include <vector>
@@ -26,7 +27,20 @@ public:
     marker_length_ = declare_parameter("marker_length", 0.04);  // black square side [m]
 
     dictionary_ = cv::aruco::getPredefinedDictionary(cv::aruco::DICT_4X4_50);
+    detector_params_ = cv::aruco::DetectorParameters::create();
+    detector_params_->cornerRefinementMethod = cv::aruco::CORNER_REFINE_SUBPIX;
 
+    // Keep nested candidates even when the white frame around the marker is thin
+    detector_params_->minMarkerDistanceRate = 0.01;
+
+    // Also find small markers, when the camera is far away
+    detector_params_->minMarkerPerimeterRate = 0.02;
+
+    // Larger thresholding windows, for big markers when the camera is close
+    detector_params_->adaptiveThreshWinSizeMin = 3;
+    detector_params_->adaptiveThreshWinSizeMax = 53;
+    detector_params_->adaptiveThreshWinSizeStep = 10;
+    
     info_sub_ = create_subscription<sensor_msgs::msg::CameraInfo>(
       "/wrist_camera/camera_info", 10,
       [this](const sensor_msgs::msg::CameraInfo & msg) {on_camera_info(msg);});
@@ -45,13 +59,11 @@ public:
 private:
   void on_camera_info(const sensor_msgs::msg::CameraInfo & msg)
   {
-    // K is a 3x3 matrix stored row by row in 9 numbers
     camera_matrix_ = cv::Mat(3, 3, CV_64F);
     for (int i = 0; i < 9; ++i) {
       camera_matrix_.at<double>(i / 3, i % 3) = msg.k[i];
     }
 
-    // Lens distortion; Gazebo cameras have none
     if (msg.d.empty()) {
       dist_coeffs_ = cv::Mat::zeros(1, 5, CV_64F);
     } else {
@@ -76,16 +88,23 @@ private:
     cv_bridge::CvImagePtr cv_image = cv_bridge::toCvCopy(msg, "bgr8");
     cv::Mat & frame = cv_image->image;
 
-    // 2. Find all markers in the image
+    // 2. Find markers, and also keep the candidates that were rejected
     std::vector<int> ids;
     std::vector<std::vector<cv::Point2f>> corners;
-    cv::aruco::detectMarkers(frame, dictionary_, corners, ids);
+    std::vector<std::vector<cv::Point2f>> rejected;
+    cv::aruco::detectMarkers(frame, dictionary_, corners, ids, detector_params_, rejected);
 
+    // Rejected candidates in red, accepted markers in green
+    if (!rejected.empty()) {
+      cv::aruco::drawDetectedMarkers(frame, rejected, cv::noArray(), cv::Scalar(0, 0, 255));
+    }
     if (!ids.empty()) {
       cv::aruco::drawDetectedMarkers(frame, corners, ids);
     }
 
     // 3. Estimate the pose of our marker
+    bool found = false;
+    double distance = 0.0;
     for (size_t i = 0; i < ids.size(); ++i) {
       if (ids[i] != marker_id_) {
         continue;
@@ -98,9 +117,29 @@ private:
 
       cv::drawFrameAxes(frame, camera_matrix_, dist_coeffs_, rvec, tvec, marker_length_ * 0.75);
       publish_pose(msg.header, rvec, tvec);
+      found = true;
+      distance = cv::norm(tvec);
     }
 
-    // 4. Publish the image with drawings for debugging
+    // 4. Status text on top of the image
+    char status[128];
+    cv::Scalar color;
+    if (found) {
+      std::snprintf(status, sizeof(status), "MARKER %d  distance %.3f m", marker_id_, distance);
+      color = cv::Scalar(0, 200, 0);
+    } else {
+      std::snprintf(status, sizeof(status), "NO MARKER");
+      color = cv::Scalar(0, 0, 255);
+    }
+    cv::putText(frame, status, cv::Point(10, 30), cv::FONT_HERSHEY_SIMPLEX, 0.8, color, 2);
+
+    char counts[128];
+    std::snprintf(
+      counts, sizeof(counts), "detected: %zu  rejected: %zu", ids.size(), rejected.size());
+    cv::putText(
+      frame, counts, cv::Point(10, 60), cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(255, 255, 255), 1);
+
+    // 5. Publish the image with drawings
     debug_pub_->publish(*cv_image->toImageMsg());
   }
 
@@ -121,7 +160,6 @@ private:
   void publish_pose(
     const std_msgs::msg::Header & header, const cv::Vec3d & rvec, const cv::Vec3d & tvec)
   {
-    // Rotation vector -> rotation matrix -> quaternion
     cv::Mat R;
     cv::Rodrigues(rvec, R);
     tf2::Matrix3x3 rotation(
@@ -131,9 +169,8 @@ private:
     tf2::Quaternion q;
     rotation.getRotation(q);
 
-    // As a message, for the servoing node
     geometry_msgs::msg::PoseStamped pose;
-    pose.header = header;  // frame_id is camera_optical_frame
+    pose.header = header;
     pose.pose.position.x = tvec[0];
     pose.pose.position.y = tvec[1];
     pose.pose.position.z = tvec[2];
@@ -143,7 +180,6 @@ private:
     pose.pose.orientation.w = q.w();
     pose_pub_->publish(pose);
 
-    // As a TF frame, for RViz and debugging
     geometry_msgs::msg::TransformStamped transform;
     transform.header = header;
     transform.child_frame_id = "aruco_marker_" + std::to_string(marker_id_);
@@ -160,6 +196,7 @@ private:
 
   // OpenCV state
   cv::Ptr<cv::aruco::Dictionary> dictionary_;
+  cv::Ptr<cv::aruco::DetectorParameters> detector_params_;
   cv::Mat camera_matrix_;
   cv::Mat dist_coeffs_;
   bool has_camera_info_ = false;
