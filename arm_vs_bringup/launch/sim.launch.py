@@ -22,11 +22,11 @@ def generate_launch_description():
         Command(['xacro ', xacro_file, ' controllers_file:=', controllers_file]),
         value_type=str)
 
-    # 1. Tell Gazebo where our models are, so model://aruco_cube can be found
+    # 1. Tell Gazebo where our models are
     model_path = AppendEnvironmentVariable(
         'GZ_SIM_RESOURCE_PATH', PathJoinSubstitution([bringup_pkg, 'models']))
 
-    # 2. Start Gazebo with our world
+    # 2. Gazebo with our world
     gazebo = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             PathJoinSubstitution([FindPackageShare('ros_gz_sim'), 'launch', 'gz_sim.launch.py'])),
@@ -45,7 +45,7 @@ def generate_launch_description():
         arguments=['-topic', 'robot_description', '-name', 'panda'],
     )
 
-    # 3. Bridge: clock, camera image and camera info from Gazebo to ROS
+    # 3. Bridge: clock, camera, and the service that moves objects
     bridge = Node(
         package='ros_gz_bridge',
         executable='parameter_bridge',
@@ -53,36 +53,33 @@ def generate_launch_description():
             '/clock@rosgraph_msgs/msg/Clock[gz.msgs.Clock',
             '/wrist_camera/image@sensor_msgs/msg/Image[gz.msgs.Image',
             '/wrist_camera/camera_info@sensor_msgs/msg/CameraInfo[gz.msgs.CameraInfo',
+            '/world/vs_world/set_pose@ros_gz_interfaces/srv/SetEntityPose',
         ],
     )
 
+    # 4. Controllers, started once the robot exists in Gazebo
     joint_state_broadcaster = Node(
-        package='controller_manager',
-        executable='spawner',
+        package='controller_manager', executable='spawner',
         arguments=['joint_state_broadcaster'],
     )
     arm_controller = Node(
-        package='controller_manager',
-        executable='spawner',
+        package='controller_manager', executable='spawner',
         arguments=['arm_controller'],
     )
     velocity_controller = Node(
-        package='controller_manager',
-        executable='spawner',
+        package='controller_manager', executable='spawner',
         arguments=['velocity_controller', '--inactive'],
     )
     gripper_controller = Node(
-        package='controller_manager',
-        executable='spawner',
+        package='controller_manager', executable='spawner',
         arguments=['gripper_controller'],
     )
-
     start_controllers = RegisterEventHandler(
         OnProcessExit(target_action=spawn_robot,
-                        on_exit=[joint_state_broadcaster, arm_controller,
+                      on_exit=[joint_state_broadcaster, arm_controller,
                                velocity_controller, gripper_controller]))
 
-    # 4. RViz for debugging
+    # 5. RViz
     rviz = Node(
         package='rviz2',
         executable='rviz2',

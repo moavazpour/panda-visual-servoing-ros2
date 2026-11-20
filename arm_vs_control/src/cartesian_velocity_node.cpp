@@ -24,6 +24,9 @@ public:
     nullspace_gain_ = declare_parameter("nullspace_gain", 0.5);
     command_timeout_ = declare_parameter("command_timeout", 0.2);
 
+    // Anti-windup: how far the internal target may run ahead of the real hand [m]
+    max_position_lead_ = declare_parameter("max_position_lead", 0.01);
+
     auto latched_qos = rclcpp::QoS(1).transient_local();
     description_sub_ = create_subscription<std_msgs::msg::String>(
       "/robot_description", latched_qos,
@@ -123,6 +126,14 @@ private:
       const Eigen::AngleAxisd step(w.norm() * kDt, w.normalized());
       target_pose_.linear() = step.toRotationMatrix() * target_pose_.linear();
     }
+    
+    // Anti-windup: if the hand is blocked, for example by a surface it touches,
+    // keep the target close to the real hand, so the pushing force cannot keep growing
+    const Eigen::Vector3d lead = target_pose_.translation() - current_pose.translation();
+    if (lead.norm() > max_position_lead_) {
+      target_pose_.translation() =
+        current_pose.translation() + lead.normalized() * max_position_lead_;
+    }
 
     // 3. Error between target and real pose (position and orientation)
     Eigen::Matrix<double, 6, 1> error;
@@ -175,7 +186,8 @@ private:
   double max_joint_velocity_;
   double nullspace_gain_;
   double command_timeout_;
-
+  double max_position_lead_;
+  
   // State
   arm_vs_control::Kinematics kinematics_;
   Eigen::VectorXd q_;

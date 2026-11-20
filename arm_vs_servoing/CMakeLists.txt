@@ -14,6 +14,7 @@ find_package(sensor_msgs REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(tf2_eigen REQUIRED)
+find_package(ros_gz_interfaces REQUIRED)
 find_package(Eigen3 REQUIRED)
 
 add_executable(visual_servo src/visual_servo.cpp)
@@ -21,17 +22,12 @@ ament_target_dependencies(visual_servo
   rclcpp geometry_msgs visualization_msgs std_msgs tf2 tf2_ros tf2_eigen)
 target_link_libraries(visual_servo Eigen3::Eigen)
 
-add_executable(pick_cube src/pick_cube.cpp)
-ament_target_dependencies(pick_cube
-  rclcpp geometry_msgs std_msgs sensor_msgs tf2 tf2_ros tf2_eigen)
-target_link_libraries(pick_cube Eigen3::Eigen)
-
 add_executable(pick_and_place src/pick_and_place.cpp)
 ament_target_dependencies(pick_and_place
-  rclcpp geometry_msgs std_msgs sensor_msgs tf2 tf2_ros tf2_eigen)
+  rclcpp geometry_msgs std_msgs sensor_msgs tf2 tf2_ros tf2_eigen ros_gz_interfaces)
 target_link_libraries(pick_and_place Eigen3::Eigen)
 
-install(TARGETS visual_servo pick_cube pick_and_place
+install(TARGETS visual_servo pick_and_place
   DESTINATION lib/${PROJECT_NAME})
 
 install(DIRECTORY launch

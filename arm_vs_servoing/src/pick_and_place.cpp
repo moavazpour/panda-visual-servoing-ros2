@@ -1,6 +1,8 @@
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <memory>
+#include <random>
 #include <string>
 
 #include <Eigen/Geometry>
@@ -8,6 +10,8 @@
 #include "geometry_msgs/msg/pose_stamped.hpp"
 #include "geometry_msgs/msg/twist.hpp"
 #include "rclcpp/rclcpp.hpp"
+#include "ros_gz_interfaces/msg/entity.hpp"
+#include "ros_gz_interfaces/srv/set_entity_pose.hpp"
 #include "sensor_msgs/msg/joint_state.hpp"
 #include "std_msgs/msg/bool.hpp"
 #include "std_msgs/msg/float64_multi_array.hpp"
@@ -17,6 +21,7 @@
 #include "tf2_ros/transform_listener.h"
 
 using namespace std::chrono_literals;
+using SetEntityPose = ros_gz_interfaces::srv::SetEntityPose;
 
 // Averages several horizontal marker poses (position and yaw)
 struct PoseAverager
@@ -61,6 +66,7 @@ public:
     tf_buffer_(get_clock()),
     tf_listener_(tf_buffer_)
   {
+    // Geometry
     tcp_offset_ = declare_parameter("tcp_offset", 0.1034);       // hand origin -> fingertip centre [m]
     cube_size_ = declare_parameter("cube_size", 0.05);           // [m]
     grasp_height_offset_ = declare_parameter("grasp_height_offset", 0.015);  // [m]
@@ -68,17 +74,30 @@ public:
     lift_height_ = declare_parameter("lift_height", 0.15);       // [m]
     standoff_ = declare_parameter("standoff", 0.20);             // camera above place marker [m]
     place_approach_height_ = declare_parameter("place_approach_height", 0.10);  // [m]
-    place_push_ = declare_parameter("place_push", 0.01);         // aim this much below contact [m]
+    place_push_ = declare_parameter("place_push", 0.01);         // aim below contact [m]
     retreat_height_ = declare_parameter("retreat_height", 0.15);  // [m]
+
+    // Motion
     gain_ = declare_parameter("gain", 1.5);
     fast_speed_ = declare_parameter("fast_speed", 0.08);         // [m/s]
     slow_speed_ = declare_parameter("slow_speed", 0.03);         // [m/s]
     max_angular_ = declare_parameter("max_angular_speed", 0.4);  // [rad/s]
     open_width_ = declare_parameter("open_width", 0.04);         // [m]
+
+    // Perception
     observe_time_ = declare_parameter("observe_time", 1.0);      // [s]
     min_samples_ = declare_parameter("min_samples", 10);
 
-    // Overview pose: the same hand pose as the robot's start position
+    // Experiment loop
+    loop_ = declare_parameter("loop", true);
+    randomize_ = declare_parameter("randomize", true);
+    min_separation_ = declare_parameter("min_separation", 0.20);  // cube <-> shelf centres [m]
+    success_tolerance_ = declare_parameter("success_tolerance", 0.02);  // [m]
+    const std::string world_name = declare_parameter("world_name", std::string("vs_world"));
+    const int seed = declare_parameter("seed", -1);
+    rng_.seed(seed < 0 ? std::random_device{}() : static_cast<unsigned>(seed));
+
+    // Overview pose: the robot's start position, both markers are visible from here
     scan_pose_ = Eigen::Isometry3d::Identity();
     scan_pose_.translation() = Eigen::Vector3d(0.307, 0.0, 0.59);
     scan_pose_.linear() =
@@ -127,17 +146,23 @@ public:
     gripper_pub_ = create_publisher<std_msgs::msg::Float64MultiArray>(
       "/gripper_controller/commands", 10);
     servo_enable_pub_ = create_publisher<std_msgs::msg::Bool>("/servo_enable", 10);
+    set_pose_client_ = create_client<SetEntityPose>("/world/" + world_name + "/set_pose");
 
     timer_ = create_wall_timer(20ms, [this]() {step();});
     state_start_ = now();
     last_motion_time_ = now();
+    enter(State::START);
 
-    RCLCPP_INFO(get_logger(), "Pick and place ready, waiting for the servo above the cube");
+    RCLCPP_INFO(get_logger(), "Pick and place started (loop=%s, randomize=%s)",
+      loop_ ? "on" : "off", randomize_ ? "on" : "off");
   }
 
 private:
   enum class State
   {
+    START,
+    RANDOMIZE,
+    SETTLE,
     WAIT_FOR_CUBE,
     OPEN_GRIPPER,
     PRE_GRASP,
@@ -153,31 +178,83 @@ private:
     RELEASE,
     RETREAT,
     VERIFY,
-    DONE,
-    FAILED
+    IDLE
   };
+
+  // Random layout ranges [m]: both markers must be visible from the scan pose
+  static constexpr double kCubeXMin = 0.40, kCubeXMax = 0.50, kCubeYMax = 0.15;
+  static constexpr double kShelfXMin = 0.40, kShelfXMax = 0.48, kShelfYMax = 0.13;
+  static constexpr double kCubeZ = 0.176;   // table top 0.15 + half cube + 1 mm
+  static constexpr double kShelfZ = 0.20;   // table top 0.15 + half shelf height
 
   // ======================= State machine =======================
 
   void step()
   {
+    // Nothing can be done before the robot pose is known
+    if (!tf_buffer_.canTransform("panda_link0", "panda_hand", tf2::TimePointZero)) {
+      return;
+    }
+    publish_servo_enable();
+
     switch (state_) {
+      // ---------- New cycle ----------
+      case State::START:
+        if (go_to(scan_pose_, fast_speed_)) {
+          set_state(randomize_ ? State::RANDOMIZE : State::SETTLE);
+        }
+        break;
+
+            case State::RANDOMIZE:
+        stop();
+        if (!layout_sent_) {
+          // A freshly started node needs a moment to discover the service
+          if (set_pose_client_->service_is_ready()) {
+            randomize_scene();
+            layout_sent_ = true;
+          } else if (seconds_in_state() > 10.0) {
+            RCLCPP_ERROR(
+              get_logger(), "Service %s not available. Is the bridge running?",
+              set_pose_client_->get_service_name());
+            set_state(State::IDLE);
+          }
+        } else if (request_failed_) {
+          RCLCPP_ERROR(get_logger(), "Could not move the objects, stopping the experiment");
+          set_state(State::IDLE);
+        } else if (pending_requests_ == 0) {
+          set_state(State::SETTLE);
+        } else if (seconds_in_state() > 15.0) {
+          RCLCPP_ERROR(get_logger(), "No answer from Gazebo, stopping the experiment");
+          set_state(State::IDLE);
+        }
+        break;
+
+      case State::SETTLE:
+        stop();
+        if (seconds_in_state() > 2.0) {
+          set_state(State::WAIT_FOR_CUBE);
+        }
+        break;
+
       // ---------- Pick ----------
       case State::WAIT_FOR_CUBE:
-       if (servo_holding_ && has_cube_ &&
-          tf_buffer_.canTransform("panda_link0", "panda_hand", tf2::TimePointZero))
-        {
+        // The servo is in control now; this node only watches
+        if (servo_holding_ && has_cube_) {
           if (seconds_in_state() > 1.0) {
             plan_grasp();
-            disable_servo();
             set_state(State::OPEN_GRIPPER);
           }
         } else {
           state_start_ = now();
         }
+        if ((now() - wait_started_).seconds() > 40.0) {
+          RCLCPP_ERROR(get_logger(), "The servo did not reach the cube in time");
+          finish_cycle(false, 0.0);
+        }
         break;
 
       case State::OPEN_GRIPPER:
+        stop();
         command_gripper(open_width_);
         if (seconds_in_state() > 1.0) {
           set_state(State::PRE_GRASP);
@@ -202,11 +279,8 @@ private:
         if (seconds_in_state() > 1.5) {
           if (finger_position_ < 0.005) {
             RCLCPP_ERROR(get_logger(), "Fingers closed on nothing, the cube was missed");
-            set_state(State::FAILED);
+            finish_cycle(false, 0.0);
           } else {
-            RCLCPP_INFO(
-              get_logger(), "Cube between the fingers, opening %.1f mm",
-              2.0 * finger_position_ * 1000.0);
             set_state(State::LIFT);
           }
         }
@@ -218,11 +292,9 @@ private:
         }
         break;
 
-      // ---------- Find the place location: coarse ----------
+      // ---------- Find the place location: coarse, then fine ----------
       case State::GO_TO_SCAN:
         if (go_to(scan_pose_, fast_speed_)) {
-          place_samples_.reset();
-          collecting_place_ = true;
           set_state(State::LOOK_FOR_PLACE);
         }
         break;
@@ -230,22 +302,17 @@ private:
       case State::LOOK_FOR_PLACE:
         stop();
         if (seconds_in_state() > observe_time_ && place_samples_.count >= min_samples_) {
-          collecting_place_ = false;
           place_estimate_ = place_samples_.mean();
           observe_pose_ = camera_above(place_estimate_);
-          log_place("Coarse place estimate");
           set_state(State::GO_ABOVE_PLACE);
         } else if (seconds_in_state() > 5.0) {
           RCLCPP_ERROR(get_logger(), "Place marker not visible from the scan pose");
-          set_state(State::FAILED);
+          finish_cycle(false, 0.0);
         }
         break;
 
-      // ---------- Find the place location: fine ----------
       case State::GO_ABOVE_PLACE:
         if (go_to(observe_pose_, fast_speed_)) {
-          place_samples_.reset();
-          collecting_place_ = true;
           set_state(State::MEASURE_PLACE);
         }
         break;
@@ -253,14 +320,12 @@ private:
       case State::MEASURE_PLACE:
         stop();
         if (seconds_in_state() > observe_time_ && place_samples_.count >= min_samples_) {
-          collecting_place_ = false;
           place_estimate_ = place_samples_.mean();
-          log_place("Fine place estimate");
           plan_place();
           set_state(State::PRE_PLACE);
         } else if (seconds_in_state() > 5.0) {
           RCLCPP_ERROR(get_logger(), "Place marker lost when looking from close by");
-          set_state(State::FAILED);
+          finish_cycle(false, 0.0);
         }
         break;
 
@@ -287,8 +352,6 @@ private:
 
       case State::RETREAT:
         if (go_to(retreat_pose_, slow_speed_)) {
-          verify_samples_.reset();
-          collecting_verify_ = true;
           set_state(State::VERIFY);
         }
         break;
@@ -297,18 +360,15 @@ private:
       case State::VERIFY:
         stop();
         if (seconds_in_state() > observe_time_ && verify_samples_.count >= min_samples_) {
-          collecting_verify_ = false;
-          report_placement_error();
-          set_state(State::DONE);
+          const double error = report_placement_error();
+          finish_cycle(error < success_tolerance_, error);
         } else if (seconds_in_state() > 4.0) {
-          collecting_verify_ = false;
-          RCLCPP_WARN(get_logger(), "Cube marker not visible, cannot verify the placement");
-          set_state(State::DONE);
+          RCLCPP_ERROR(get_logger(), "Cube not visible on the shelf after placing");
+          finish_cycle(false, 0.0);
         }
         break;
 
-      case State::DONE:
-      case State::FAILED:
+      case State::IDLE:
         stop();
         break;
     }
@@ -317,9 +377,9 @@ private:
   void set_state(State next)
   {
     static const char * names[] = {
-      "WAIT_FOR_CUBE", "OPEN_GRIPPER", "PRE_GRASP", "DESCEND", "CLOSE_GRIPPER", "LIFT",
-      "GO_TO_SCAN", "LOOK_FOR_PLACE", "GO_ABOVE_PLACE", "MEASURE_PLACE",
-      "PRE_PLACE", "PLACE_DESCEND", "RELEASE", "RETREAT", "VERIFY", "DONE", "FAILED"};
+      "START", "RANDOMIZE", "SETTLE", "WAIT_FOR_CUBE", "OPEN_GRIPPER", "PRE_GRASP",
+      "DESCEND", "CLOSE_GRIPPER", "LIFT", "GO_TO_SCAN", "LOOK_FOR_PLACE", "GO_ABOVE_PLACE",
+      "MEASURE_PLACE", "PRE_PLACE", "PLACE_DESCEND", "RELEASE", "RETREAT", "VERIFY", "IDLE"};
     RCLCPP_INFO(
       get_logger(), "%s -> %s",
       names[static_cast<int>(state_)], names[static_cast<int>(next)]);
@@ -327,9 +387,65 @@ private:
     state_start_ = now();
     last_motion_time_ = now();
     last_hand_z_ = 1e9;
+    collecting_place_ = false;
+    collecting_verify_ = false;
+    enter(next);
+  }
+
+  // Actions that run once when a state is entered
+  void enter(State s)
+  {
+    switch (s) {
+      case State::START:
+        servo_enabled_ = false;
+        command_gripper(open_width_);
+        break;
+      case State::RANDOMIZE:
+        layout_sent_ = false;
+        pending_requests_ = 0;
+        request_failed_ = false;
+        break;
+      case State::WAIT_FOR_CUBE:
+        has_cube_ = false;
+        servo_holding_ = false;
+        servo_enabled_ = true;
+        wait_started_ = now();
+        break;
+      case State::OPEN_GRIPPER:
+        servo_enabled_ = false;  // this node takes over from here
+        break;
+      case State::LOOK_FOR_PLACE:
+      case State::MEASURE_PLACE:
+        place_samples_.reset();
+        collecting_place_ = true;
+        break;
+      case State::VERIFY:
+        verify_samples_.reset();
+        collecting_verify_ = true;
+        break;
+      default:
+        break;
+    }
   }
 
   double seconds_in_state() {return (now() - state_start_).seconds();}
+
+  void finish_cycle(bool success, double error)
+  {
+    ++cycles_;
+    if (success) {
+      ++successes_;
+      error_sum_ += error;
+      max_error_ = std::max(max_error_, error);
+    }
+    const double mean_error = successes_ > 0 ? error_sum_ / successes_ : 0.0;
+    RCLCPP_INFO(
+      get_logger(),
+      "===== Cycle %d: %s | success %d/%d (%.0f%%) | mean error %.1f mm | max error %.1f mm =====",
+      cycles_, success ? "SUCCESS" : "FAILED", successes_, cycles_,
+      100.0 * successes_ / cycles_, mean_error * 1000.0, max_error_ * 1000.0);
+    set_state(loop_ ? State::START : State::IDLE);
+  }
 
   // True if the hand has not moved for 0.5 s while it is close to the target
   bool contact_detected(const Eigen::Isometry3d & target)
@@ -342,11 +458,80 @@ private:
     }
     const double remaining = z - target.translation().z();
     if (remaining < 0.03 && (now() - last_motion_time_).seconds() > 0.5) {
-      RCLCPP_WARN(
-        get_logger(), "Contact detected %.1f mm above the target", remaining * 1000.0);
+      RCLCPP_INFO(get_logger(), "Contact %.1f mm above the target", remaining * 1000.0);
       return true;
     }
     return false;
+  }
+
+  // ======================= Scene randomization =======================
+
+  void randomize_scene()
+  {
+    pending_requests_ = 0;
+    request_failed_ = false;
+
+    if (!set_pose_client_->service_is_ready()) {
+      RCLCPP_ERROR(
+        get_logger(), "Service %s not available. Is the bridge running?",
+        set_pose_client_->get_service_name());
+      request_failed_ = true;
+      return;
+    }
+
+    std::uniform_real_distribution<double> cube_x(kCubeXMin, kCubeXMax);
+    std::uniform_real_distribution<double> cube_y(-kCubeYMax, kCubeYMax);
+    std::uniform_real_distribution<double> shelf_x(kShelfXMin, kShelfXMax);
+    std::uniform_real_distribution<double> shelf_y(-kShelfYMax, kShelfYMax);
+    std::uniform_real_distribution<double> yaw(-M_PI / 4.0, M_PI / 4.0);
+
+    // Draw random layouts until cube and shelf are far enough apart
+    double cx = 0.0, cy = 0.0, sx = 0.0, sy = 0.0;
+    bool found = false;
+    for (int i = 0; i < 500 && !found; ++i) {
+      cx = cube_x(rng_);
+      cy = cube_y(rng_);
+      sx = shelf_x(rng_);
+      sy = shelf_y(rng_);
+      found = std::hypot(cx - sx, cy - sy) >= min_separation_;
+    }
+    if (!found) {
+      RCLCPP_ERROR(get_logger(), "Could not find a valid random layout");
+      request_failed_ = true;
+      return;
+    }
+
+    const double cube_yaw = yaw(rng_);
+    const double shelf_yaw = yaw(rng_);
+    send_pose("aruco_cube", cx, cy, kCubeZ, cube_yaw);
+    send_pose("place_shelf", sx, sy, kShelfZ, shelf_yaw);
+
+    RCLCPP_INFO(
+      get_logger(), "New layout: cube x=%.3f y=%.3f yaw %.0f deg | shelf x=%.3f y=%.3f yaw %.0f deg",
+      cx, cy, cube_yaw * 180.0 / M_PI, sx, sy, shelf_yaw * 180.0 / M_PI);
+  }
+
+  void send_pose(const std::string & name, double x, double y, double z, double yaw)
+  {
+    auto request = std::make_shared<SetEntityPose::Request>();
+    request->entity.name = name;
+    request->entity.type = ros_gz_interfaces::msg::Entity::MODEL;
+    request->pose.position.x = x;
+    request->pose.position.y = y;
+    request->pose.position.z = z;
+    request->pose.orientation.z = std::sin(yaw / 2.0);
+    request->pose.orientation.w = std::cos(yaw / 2.0);
+
+    ++pending_requests_;
+    set_pose_client_->async_send_request(
+      request,
+      [this, name](rclcpp::Client<SetEntityPose>::SharedFuture future) {
+        --pending_requests_;
+        if (!future.get()->success) {
+          RCLCPP_ERROR(get_logger(), "Gazebo could not move %s", name.c_str());
+          request_failed_ = true;
+        }
+      });
   }
 
   // ======================= Planning =======================
@@ -365,22 +550,15 @@ private:
 
     lift_pose_ = grasp_pose_;
     lift_pose_.translation().z() += lift_height_;
-
-    RCLCPP_INFO(
-      get_logger(), "Cube centre at x=%.3f y=%.3f z=%.3f, yaw %.1f deg",
-      cube_centre.x(), cube_centre.y(), cube_centre.z(), yaw_of(cube_top_) * 180.0 / M_PI);
   }
 
   void plan_place()
   {
     const Eigen::Vector3d p = place_estimate_.translation();
-
-    // Hand height at which the cube bottom touches the shelf
     const double contact_z = p.z() + cube_size_ / 2.0 + grasp_height_offset_ + tcp_offset_;
 
     place_pose_ = Eigen::Isometry3d::Identity();
     place_pose_.linear() = aligned_hand_rotation(yaw_of(place_estimate_));
-    // Aim a little below contact, so the contact detection stops the hand
     place_pose_.translation() = Eigen::Vector3d(p.x(), p.y(), contact_z - place_push_);
 
     preplace_pose_ = place_pose_;
@@ -390,7 +568,7 @@ private:
     retreat_pose_.translation().z() = contact_z + retreat_height_;
   }
 
-  // Hand pointing down, fingers parallel to a face of a square object with this yaw.
+  // Hand pointing down, fingers parallel to a face of a square with this yaw.
   // A square looks the same every 90 degrees: pick the option closest to the hand now.
   Eigen::Matrix3d aligned_hand_rotation(double yaw)
   {
@@ -443,7 +621,6 @@ private:
 
   // ======================= Perception helpers =======================
 
-  // Marker pose (camera frame) -> horizontal marker pose in the robot base frame
   bool marker_in_base(const geometry_msgs::msg::PoseStamped & msg, Eigen::Isometry3d & out)
   {
     camera_frame_ = msg.header.frame_id;
@@ -478,27 +655,19 @@ private:
     return std::atan2(T.linear()(1, 0), T.linear()(0, 0));
   }
 
-  void log_place(const char * label)
-  {
-    const Eigen::Vector3d p = place_estimate_.translation();
-    RCLCPP_INFO(
-      get_logger(), "%s: x=%.3f y=%.3f z=%.3f, yaw %.1f deg (%d samples)",
-      label, p.x(), p.y(), p.z(), yaw_of(place_estimate_) * 180.0 / M_PI, place_samples_.count);
-  }
-
-  void report_placement_error()
+  // Logs the placement error and returns its size [m]
+  double report_placement_error()
   {
     const Eigen::Isometry3d cube = verify_samples_.mean();
     const Eigen::Vector2d error =
       cube.translation().head<2>() - place_estimate_.translation().head<2>();
-    // The cube looks the same every 90 degrees, so the error is in [-45, 45] deg
     const double yaw_error = std::remainder(yaw_of(cube) - yaw_of(place_estimate_), M_PI / 2.0);
 
     RCLCPP_INFO(
-      get_logger(),
-      "Placement error: %.1f mm (x %.1f mm, y %.1f mm), rotation %.1f deg",
+      get_logger(), "Placement error: %.1f mm (x %.1f mm, y %.1f mm), rotation %.1f deg",
       error.norm() * 1000.0, error.x() * 1000.0, error.y() * 1000.0,
       yaw_error * 180.0 / M_PI);
+    return error.norm();
   }
 
   // ======================= Motion helpers =======================
@@ -556,10 +725,11 @@ private:
     gripper_pub_->publish(msg);
   }
 
-  void disable_servo()
+  // Sent every cycle, so the servo gets it even if it starts later than this node
+  void publish_servo_enable()
   {
     std_msgs::msg::Bool msg;
-    msg.data = false;
+    msg.data = servo_enabled_;
     servo_enable_pub_->publish(msg);
   }
 
@@ -580,22 +750,30 @@ private:
   double open_width_;
   double observe_time_;
   int min_samples_;
+  bool loop_;
+  bool randomize_;
+  double min_separation_;
+  double success_tolerance_;
 
-  // State
-  State state_ = State::WAIT_FOR_CUBE;
+  // State machine
+  State state_ = State::START;
   rclcpp::Time state_start_;
+  rclcpp::Time wait_started_;
   rclcpp::Time last_motion_time_;
   double last_hand_z_ = 1e9;
+  bool servo_enabled_ = false;
+
+  // Inputs
   bool has_cube_ = false;
   bool servo_holding_ = false;
   double finger_position_ = 0.0;
   std::string camera_frame_ = "camera_optical_frame";
-
   bool collecting_place_ = false;
   bool collecting_verify_ = false;
   PoseAverager place_samples_;
   PoseAverager verify_samples_;
 
+  // Poses
   Eigen::Isometry3d cube_top_ = Eigen::Isometry3d::Identity();
   Eigen::Isometry3d place_estimate_ = Eigen::Isometry3d::Identity();
   Eigen::Isometry3d grasp_pose_ = Eigen::Isometry3d::Identity();
@@ -606,6 +784,16 @@ private:
   Eigen::Isometry3d place_pose_ = Eigen::Isometry3d::Identity();
   Eigen::Isometry3d preplace_pose_ = Eigen::Isometry3d::Identity();
   Eigen::Isometry3d retreat_pose_ = Eigen::Isometry3d::Identity();
+
+  // Randomization and statistics
+  std::mt19937 rng_;
+  int pending_requests_ = 0;
+  bool request_failed_ = false;
+  bool layout_sent_ = false;
+  int cycles_ = 0;
+  int successes_ = 0;
+  double error_sum_ = 0.0;
+  double max_error_ = 0.0;
 
   // TF
   tf2_ros::Buffer tf_buffer_;
@@ -620,6 +808,7 @@ private:
   rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr twist_pub_;
   rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr gripper_pub_;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr servo_enable_pub_;
+  rclcpp::Client<SetEntityPose>::SharedPtr set_pose_client_;
   rclcpp::TimerBase::SharedPtr timer_;
 };
 

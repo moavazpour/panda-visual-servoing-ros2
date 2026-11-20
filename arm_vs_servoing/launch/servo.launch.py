@@ -1,10 +1,17 @@
 from launch import LaunchDescription
-from launch.actions import ExecuteProcess
+from launch.actions import DeclareLaunchArgument, ExecuteProcess
+from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description():
-    # 1. Switch from the position controller to the velocity controller
+    servo_enabled = LaunchConfiguration('servo_enabled')
+
+    declare_servo_enabled = DeclareLaunchArgument(
+        'servo_enabled', default_value='true',
+        description='Start the visual servo active (true) or wait for /servo_enable (false)')
+
     switch_controllers = ExecuteProcess(
         cmd=['ros2', 'control', 'switch_controllers',
              '--activate', 'velocity_controller',
@@ -12,7 +19,6 @@ def generate_launch_description():
         output='screen',
     )
 
-    # 2. Marker 0: the cube
     cube_detector = Node(
         package='arm_vs_perception',
         executable='marker_detector',
@@ -21,7 +27,6 @@ def generate_launch_description():
         output='screen',
     )
 
-    # 3. Marker 1: the place location, same program with other topic names
     place_detector = Node(
         package='arm_vs_perception',
         executable='marker_detector',
@@ -34,22 +39,24 @@ def generate_launch_description():
         output='screen',
     )
 
-    # 4. Cartesian velocity control
     cartesian_velocity = Node(
         package='arm_vs_control',
         executable='cartesian_velocity_node',
         output='screen',
     )
 
-    # 5. Visual servoing
     visual_servo = Node(
         package='arm_vs_servoing',
         executable='visual_servo',
-        parameters=[{'use_sim_time': True}],
+        parameters=[{
+            'use_sim_time': True,
+            'start_enabled': ParameterValue(servo_enabled, value_type=bool),
+        }],
         output='screen',
     )
 
     return LaunchDescription([
+        declare_servo_enabled,
         switch_controllers,
         cube_detector,
         place_detector,

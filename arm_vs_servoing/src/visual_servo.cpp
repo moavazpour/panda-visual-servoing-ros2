@@ -51,18 +51,28 @@ public:
     // Size of the cube under the marker, only for visualization [m]
     cube_size_ = declare_parameter("cube_size", 0.05);
 
+    // Start active, or wait until another node enables the servo
+    enabled_ = declare_parameter("start_enabled", true);
+
     marker_sub_ = create_subscription<geometry_msgs::msg::PoseStamped>(
       "/marker_pose", 10,
       [this](const geometry_msgs::msg::PoseStamped & msg) {on_marker_pose(msg);});
 
-    // Another node can switch the servo off to take over control
-    enable_sub_ = create_subscription<std_msgs::msg::Bool>(
+       enable_sub_ = create_subscription<std_msgs::msg::Bool>(
       "/servo_enable", 10,
       [this](const std_msgs::msg::Bool & msg) {
-        if (enabled_ != msg.data) {
-          RCLCPP_INFO(get_logger(), "Servo %s", msg.data ? "enabled" : "disabled");
+        if (enabled_ == msg.data) {
+          return;
         }
+        RCLCPP_INFO(get_logger(), "Servo %s", msg.data ? "enabled" : "disabled");
         enabled_ = msg.data;
+        if (enabled_) {
+          // Forget the previous cube: it may have been moved since
+          holding_ = false;
+          filter_initialized_ = false;
+          marker_lost_ = false;
+          last_marker_time_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
+        }
       });
 
     twist_pub_ = create_publisher<geometry_msgs::msg::Twist>("/target_twist", 10);
