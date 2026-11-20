@@ -6,12 +6,15 @@
 #include <Eigen/Geometry>
 
 #include "geometry_msgs/msg/pose_stamped.hpp"
+#include "geometry_msgs/msg/transform_stamped.hpp"
 #include "geometry_msgs/msg/twist.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "tf2/exceptions.h"
 #include "tf2_eigen/tf2_eigen.hpp"
 #include "tf2_ros/buffer.h"
+#include "tf2_ros/transform_broadcaster.h"
 #include "tf2_ros/transform_listener.h"
+#include "visualization_msgs/msg/marker.hpp"
 
 class VisualServo : public rclcpp::Node
 {
@@ -44,11 +47,16 @@ public:
     ws_max_x_ = declare_parameter("workspace_max_x", 0.65);
     ws_max_y_ = declare_parameter("workspace_max_abs_y", 0.25);
 
+    // Size of the cube under the marker, only for visualization [m]
+    cube_size_ = declare_parameter("cube_size", 0.05);
+
     marker_sub_ = create_subscription<geometry_msgs::msg::PoseStamped>(
       "/marker_pose", 10,
       [this](const geometry_msgs::msg::PoseStamped & msg) {on_marker_pose(msg);});
 
     twist_pub_ = create_publisher<geometry_msgs::msg::Twist>("/target_twist", 10);
+    viz_pub_ = create_publisher<visualization_msgs::msg::Marker>("/servo_visualization", 10);
+    tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
 
     watchdog_timer_ = create_wall_timer(
       std::chrono::milliseconds(200), [this]() {check_marker_timeout();});
@@ -167,10 +175,53 @@ private:
     }
     twist_pub_->publish(twist);
 
+    // 8. Show what the servo is thinking in RViz
+    publish_visualization(T_base_marker, best_target, msg.header.stamp);
+
     RCLCPP_INFO_THROTTLE(
       get_logger(), *get_clock(), 1000,
       "[%s] position error: %.1f mm, rotation error: %.1f deg",
       holding_ ? "HOLD" : "MOVE", pos_err * 1000.0, rot_err * 180.0 / M_PI);
+  }
+
+  void publish_visualization(
+    const Eigen::Isometry3d & marker, const Eigen::Isometry3d & hand_target,
+    const builtin_interfaces::msg::Time & stamp)
+  {
+    // Two TF frames: where the servo wants the hand, and where it thinks the marker is
+    geometry_msgs::msg::TransformStamped target_tf = tf2::eigenToTransform(hand_target);
+    target_tf.header.stamp = stamp;
+    target_tf.header.frame_id = "panda_link0";
+    target_tf.child_frame_id = "hand_target";
+
+    geometry_msgs::msg::TransformStamped marker_tf = tf2::eigenToTransform(marker);
+    marker_tf.header.stamp = stamp;
+    marker_tf.header.frame_id = "panda_link0";
+    marker_tf.child_frame_id = "marker_filtered";
+
+    tf_broadcaster_->sendTransform({target_tf, marker_tf});
+
+    // A transparent cube: the marker is on the top face, so the centre is half a cube lower
+    const Eigen::Isometry3d cube_centre =
+      marker * Eigen::Translation3d(0.0, 0.0, -cube_size_ / 2.0);
+
+    visualization_msgs::msg::Marker cube;
+    cube.header.stamp = stamp;
+    cube.header.frame_id = "panda_link0";
+    cube.ns = "estimated_cube";
+    cube.id = 0;
+    cube.type = visualization_msgs::msg::Marker::CUBE;
+    cube.action = visualization_msgs::msg::Marker::ADD;
+    cube.pose = tf2::toMsg(cube_centre);
+    cube.scale.x = cube_size_;
+    cube.scale.y = cube_size_;
+    cube.scale.z = cube_size_;
+    // Green when holding, blue when moving
+    cube.color.r = 0.1f;
+    cube.color.g = holding_ ? 0.9f : 0.5f;
+    cube.color.b = holding_ ? 0.2f : 1.0f;
+    cube.color.a = 0.5f;
+    viz_pub_->publish(cube);
   }
 
   // The cube lies on a flat table, so its top face is horizontal.
@@ -208,7 +259,6 @@ private:
         RCLCPP_WARN(get_logger(), "Ignoring outlier: marker jumped %.1f mm", jump * 1000.0);
         return false;
       }
-      // The jump is consistent: the cube really moved, start the filter again there
       RCLCPP_INFO(get_logger(), "Marker position changed a lot, accepting new position");
       filtered_position_ = raw_position;
       filtered_rotation_ = raw_rotation;
@@ -264,6 +314,7 @@ private:
   double ws_min_x_;
   double ws_max_x_;
   double ws_max_y_;
+  double cube_size_;
 
   // State
   bool holding_ = false;
@@ -277,10 +328,12 @@ private:
   // TF
   tf2_ros::Buffer tf_buffer_;
   tf2_ros::TransformListener tf_listener_;
+  std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
 
   // ROS interfaces
   rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr marker_sub_;
   rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr twist_pub_;
+  rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr viz_pub_;
   rclcpp::TimerBase::SharedPtr watchdog_timer_;
 };
 

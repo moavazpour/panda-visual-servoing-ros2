@@ -8,6 +8,7 @@ endif()
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(geometry_msgs REQUIRED)
+find_package(visualization_msgs REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(tf2_eigen REQUIRED)
@@ -15,7 +16,7 @@ find_package(Eigen3 REQUIRED)
 
 add_executable(visual_servo src/visual_servo.cpp)
 ament_target_dependencies(visual_servo
-  rclcpp geometry_msgs tf2 tf2_ros tf2_eigen)
+  rclcpp geometry_msgs visualization_msgs tf2 tf2_ros tf2_eigen)
 target_link_libraries(visual_servo Eigen3::Eigen)
 
 install(TARGETS visual_servo
