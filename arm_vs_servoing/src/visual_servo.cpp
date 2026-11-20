@@ -9,6 +9,7 @@
 #include "geometry_msgs/msg/transform_stamped.hpp"
 #include "geometry_msgs/msg/twist.hpp"
 #include "rclcpp/rclcpp.hpp"
+#include "std_msgs/msg/bool.hpp"
 #include "tf2/exceptions.h"
 #include "tf2_eigen/tf2_eigen.hpp"
 #include "tf2_ros/buffer.h"
@@ -54,8 +55,20 @@ public:
       "/marker_pose", 10,
       [this](const geometry_msgs::msg::PoseStamped & msg) {on_marker_pose(msg);});
 
+    // Another node can switch the servo off to take over control
+    enable_sub_ = create_subscription<std_msgs::msg::Bool>(
+      "/servo_enable", 10,
+      [this](const std_msgs::msg::Bool & msg) {
+        if (enabled_ != msg.data) {
+          RCLCPP_INFO(get_logger(), "Servo %s", msg.data ? "enabled" : "disabled");
+        }
+        enabled_ = msg.data;
+      });
+
     twist_pub_ = create_publisher<geometry_msgs::msg::Twist>("/target_twist", 10);
     viz_pub_ = create_publisher<visualization_msgs::msg::Marker>("/servo_visualization", 10);
+    cube_pose_pub_ = create_publisher<geometry_msgs::msg::PoseStamped>("/cube_pose", 10);
+    holding_pub_ = create_publisher<std_msgs::msg::Bool>("/servo_holding", 10);
     tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
 
     watchdog_timer_ = create_wall_timer(
@@ -67,6 +80,10 @@ public:
 private:
   void on_marker_pose(const geometry_msgs::msg::PoseStamped & msg)
   {
+    if (!enabled_) {
+      return;  // another node has taken over
+    }
+
     const std::string camera_frame = msg.header.frame_id;
 
     // 1. Read the transforms we need from TF
@@ -88,7 +105,6 @@ private:
     Eigen::Isometry3d T_camera_marker;
     tf2::fromMsg(msg.pose, T_camera_marker);
 
-    // Second line of defence against invalid numbers
     if (!T_camera_marker.matrix().allFinite()) {
       return;
     }
@@ -114,8 +130,16 @@ private:
         "Marker at x=%.2f y=%.2f is outside the workspace, holding position", m.x(), m.y());
       twist_pub_->publish(geometry_msgs::msg::Twist());
       holding_ = false;
+      publish_holding();
       return;
     }
+
+    // Share the filtered cube pose with other nodes
+    geometry_msgs::msg::PoseStamped cube_pose;
+    cube_pose.header.stamp = msg.header.stamp;
+    cube_pose.header.frame_id = "panda_link0";
+    cube_pose.pose = tf2::toMsg(T_base_marker);
+    cube_pose_pub_->publish(cube_pose);
 
     // 3. Current hand pose (at the same moment as the image)
     const Eigen::Isometry3d T_base_hand = T_base_camera * T_camera_hand;
@@ -154,6 +178,7 @@ private:
       holding_ = true;
       RCLCPP_INFO(get_logger(), "Converged, holding position");
     }
+    publish_holding();
 
     // 7. Control law, only while moving
     geometry_msgs::msg::Twist twist;  // all zeros by default
@@ -184,11 +209,17 @@ private:
       holding_ ? "HOLD" : "MOVE", pos_err * 1000.0, rot_err * 180.0 / M_PI);
   }
 
+  void publish_holding()
+  {
+    std_msgs::msg::Bool msg;
+    msg.data = holding_;
+    holding_pub_->publish(msg);
+  }
+
   void publish_visualization(
     const Eigen::Isometry3d & marker, const Eigen::Isometry3d & hand_target,
     const builtin_interfaces::msg::Time & stamp)
   {
-    // Two TF frames: where the servo wants the hand, and where it thinks the marker is
     geometry_msgs::msg::TransformStamped target_tf = tf2::eigenToTransform(hand_target);
     target_tf.header.stamp = stamp;
     target_tf.header.frame_id = "panda_link0";
@@ -201,7 +232,6 @@ private:
 
     tf_broadcaster_->sendTransform({target_tf, marker_tf});
 
-    // A transparent cube: the marker is on the top face, so the centre is half a cube lower
     const Eigen::Isometry3d cube_centre =
       marker * Eigen::Translation3d(0.0, 0.0, -cube_size_ / 2.0);
 
@@ -216,7 +246,6 @@ private:
     cube.scale.x = cube_size_;
     cube.scale.y = cube_size_;
     cube.scale.z = cube_size_;
-    // Green when holding, blue when moving
     cube.color.r = 0.1f;
     cube.color.g = holding_ ? 0.9f : 0.5f;
     cube.color.b = holding_ ? 0.2f : 1.0f;
@@ -224,8 +253,6 @@ private:
     viz_pub_->publish(cube);
   }
 
-  // The cube lies on a flat table, so its top face is horizontal.
-  // Keep only the rotation around the vertical axis and drop the noisy tilt.
   static Eigen::Isometry3d keep_horizontal(const Eigen::Isometry3d & T)
   {
     const Eigen::Vector3d x_axis = T.linear().col(0);
@@ -237,7 +264,6 @@ private:
     return flat;
   }
 
-  // Returns false if the measurement was rejected as an outlier
   bool update_filter(const Eigen::Isometry3d & raw)
   {
     const Eigen::Vector3d raw_position = raw.translation();
@@ -251,7 +277,6 @@ private:
       return true;
     }
 
-    // Outlier rejection: ignore a sudden jump, unless it keeps repeating
     const double jump = (raw_position - filtered_position_).norm();
     if (jump > max_jump_) {
       ++outlier_count_;
@@ -267,12 +292,10 @@ private:
     }
     outlier_count_ = 0;
 
-    // Position: exponential moving average (like an RC low-pass filter)
     filtered_position_ = filter_alpha_ * raw_position + (1.0 - filter_alpha_) * filtered_position_;
 
-    // Rotation: move a fraction of the way towards the new measurement
     if (filtered_rotation_.dot(raw_rotation) < 0.0) {
-      raw_rotation.coeffs() *= -1.0;  // q and -q are the same rotation; pick the closer one
+      raw_rotation.coeffs() *= -1.0;
     }
     filtered_rotation_ = filtered_rotation_.slerp(filter_alpha_, raw_rotation).normalized();
     return true;
@@ -288,14 +311,15 @@ private:
 
   void check_marker_timeout()
   {
-    if (last_marker_time_.nanoseconds() == 0) {
-      return;  // marker never seen yet
+    if (!enabled_ || last_marker_time_.nanoseconds() == 0) {
+      return;
     }
     if (!marker_lost_ && (now() - last_marker_time_).seconds() > 0.5) {
       RCLCPP_WARN(get_logger(), "Marker lost, robot stops until it is visible again");
       marker_lost_ = true;
-      filter_initialized_ = false;  // start fresh when the marker comes back
+      filter_initialized_ = false;
       holding_ = false;
+      publish_holding();
     }
   }
 
@@ -317,6 +341,7 @@ private:
   double cube_size_;
 
   // State
+  bool enabled_ = true;
   bool holding_ = false;
   bool marker_lost_ = false;
   bool filter_initialized_ = false;
@@ -332,8 +357,11 @@ private:
 
   // ROS interfaces
   rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr marker_sub_;
+  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr enable_sub_;
   rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr twist_pub_;
   rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr viz_pub_;
+  rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr cube_pose_pub_;
+  rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr holding_pub_;
   rclcpp::TimerBase::SharedPtr watchdog_timer_;
 };
 

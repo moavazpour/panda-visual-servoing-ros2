@@ -84,6 +84,21 @@
     <xacro:arm_joint name="panda_joint5" initial="0.0"/>
     <xacro:arm_joint name="panda_joint6" initial="1.571"/>
     <xacro:arm_joint name="panda_joint7" initial="0.785"/>
+   
+        <!-- Gripper: finger 1 is commanded, finger 2 mimics it (state only) -->
+    <joint name="panda_finger_joint1">
+      <command_interface name="position"/>
+      <state_interface name="position">
+        <param name="initial_value">0.04</param>
+      </state_interface>
+      <state_interface name="velocity"/>
+    </joint>
+    <joint name="panda_finger_joint2">
+      <state_interface name="position">
+        <param name="initial_value">0.04</param>
+      </state_interface>
+      <state_interface name="velocity"/>
+    </joint>
   </ros2_control>
 
   <!-- 5. Plugin that connects ros2_control to Gazebo -->

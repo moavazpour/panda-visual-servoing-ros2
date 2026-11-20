@@ -71,10 +71,16 @@ def generate_launch_description():
         executable='spawner',
         arguments=['velocity_controller', '--inactive'],
     )
+    gripper_controller = Node(
+        package='controller_manager',
+        executable='spawner',
+        arguments=['gripper_controller'],
+    )
 
     start_controllers = RegisterEventHandler(
         OnProcessExit(target_action=spawn_robot,
-                      on_exit=[joint_state_broadcaster, arm_controller, velocity_controller]))
+                        on_exit=[joint_state_broadcaster, arm_controller,
+                               velocity_controller, gripper_controller]))
 
     # 4. RViz for debugging
     rviz = Node(
