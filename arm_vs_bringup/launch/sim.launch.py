@@ -59,11 +59,16 @@ def generate_launch_description():
         executable='spawner',
         arguments=['arm_controller'],
     )
+    velocity_controller = Node(
+        package='controller_manager',
+        executable='spawner',
+        arguments=['velocity_controller', '--inactive'],
+    )
 
     # Controllers can only start after the robot is in Gazebo
     start_controllers = RegisterEventHandler(
         OnProcessExit(target_action=spawn_robot,
-                      on_exit=[joint_state_broadcaster, arm_controller]))
+                      on_exit=[joint_state_broadcaster, arm_controller, velocity_controller]))
 
     return LaunchDescription([
         gazebo,

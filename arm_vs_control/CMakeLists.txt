@@ -12,6 +12,7 @@ find_package(control_msgs REQUIRED)
 find_package(trajectory_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
+find_package(geometry_msgs REQUIRED)
 find_package(kdl_parser REQUIRED)
 find_package(orocos_kdl_vendor REQUIRED)
 find_package(orocos_kdl REQUIRED)
@@ -35,7 +36,13 @@ add_executable(fk_monitor src/fk_monitor.cpp)
 target_link_libraries(fk_monitor arm_vs_kinematics)
 ament_target_dependencies(fk_monitor rclcpp sensor_msgs std_msgs)
 
-install(TARGETS arm_vs_kinematics move_to_poses fk_monitor
+# --- Program from day 6 ---
+add_executable(cartesian_velocity_node src/cartesian_velocity_node.cpp)
+target_link_libraries(cartesian_velocity_node arm_vs_kinematics)
+ament_target_dependencies(cartesian_velocity_node
+  rclcpp sensor_msgs std_msgs geometry_msgs)
+
+install(TARGETS arm_vs_kinematics move_to_poses fk_monitor cartesian_velocity_node
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib
   RUNTIME DESTINATION lib/${PROJECT_NAME})
