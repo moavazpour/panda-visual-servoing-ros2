@@ -1,4 +1,5 @@
 #include <chrono>
+#include <cmath>
 #include <memory>
 
 #include "arm_vs_control/kinematics.hpp"
@@ -16,8 +17,9 @@ public:
   CartesianVelocityNode()
   : Node("cartesian_velocity_node")
   {
-    // Tunable settings, can be changed at startup with --ros-args -p name:=value
-    damping_ = declare_parameter("damping", 0.05);
+    max_damping_ = declare_parameter("max_damping", 0.05);
+    manipulability_threshold_ = declare_parameter("manipulability_threshold", 0.03);
+    position_gain_ = declare_parameter("position_gain", 2.0);
     max_joint_velocity_ = declare_parameter("max_joint_velocity", 0.5);
     nullspace_gain_ = declare_parameter("nullspace_gain", 0.5);
     command_timeout_ = declare_parameter("command_timeout", 0.2);
@@ -38,11 +40,12 @@ public:
     command_pub_ = create_publisher<std_msgs::msg::Float64MultiArray>(
       "/velocity_controller/commands", 10);
 
-    // Control loop at 100 Hz
     timer_ = create_wall_timer(10ms, [this]() {control_step();});
   }
 
 private:
+  static constexpr double kDt = 0.01;  // control period [s], matches the 10 ms timer
+
   void on_description(const std_msgs::msg::String & msg)
   {
     if (!kinematics_.init(msg.data, "panda_link0", "panda_hand")) {
@@ -75,7 +78,6 @@ private:
 
   void on_twist(const geometry_msgs::msg::Twist & msg)
   {
-    // Order: 3 linear [m/s], then 3 angular [rad/s], all in the base frame
     twist_ << msg.linear.x, msg.linear.y, msg.linear.z,
       msg.angular.x, msg.angular.y, msg.angular.z;
     last_command_time_ = now();
@@ -91,42 +93,85 @@ private:
     const auto n = kinematics_.num_joints();
     Eigen::VectorXd qdot = Eigen::VectorXd::Zero(n);
 
-    // Safety: only move if the last command is recent (watchdog)
     const bool command_fresh =
       has_command_ && (now() - last_command_time_).seconds() < command_timeout_;
 
-    if (command_fresh) {
-      Eigen::MatrixXd J;
-      if (!kinematics_.jacobian(q_, J)) {
-        return;
-      }
-
-      // 1. Damped least-squares pseudo-inverse
-      const Eigen::MatrixXd JJt =
-        J * J.transpose() + damping_ * damping_ * Eigen::MatrixXd::Identity(6, 6);
-      const Eigen::MatrixXd J_pinv = J.transpose() * JJt.inverse();
-
-      // 2. Main task: follow the requested hand velocity
-      qdot = J_pinv * twist_;
-
-      // 3. Secondary task in the null space: pull joints towards the home pose
-      const Eigen::MatrixXd N = Eigen::MatrixXd::Identity(n, n) - J_pinv * J;
-      qdot += N * (nullspace_gain_ * (q_home_ - q_));
-
-      // 4. Safety: limit joint speed, scale all joints together to keep the direction
-      const double fastest = qdot.cwiseAbs().maxCoeff();
-      if (fastest > max_joint_velocity_) {
-        qdot *= max_joint_velocity_ / fastest;
-      }
+    Eigen::Isometry3d current_pose;
+    Eigen::MatrixXd J;
+    if (!kinematics_.forward(q_, current_pose) || !kinematics_.jacobian(q_, J)) {
+      return;
     }
 
+    if (!command_fresh) {
+      // Idle: forget the target, it will be set again when a new command starts
+      tracking_ = false;
+      publish(qdot);
+      return;
+    }
+
+    // 1. When a new command starts, the current hand pose becomes the target
+    if (!tracking_) {
+      target_pose_ = current_pose;
+      tracking_ = true;
+    }
+
+    // 2. Move the target forward with the commanded velocity
+    const Eigen::Vector3d v = twist_.head<3>();
+    const Eigen::Vector3d w = twist_.tail<3>();
+    target_pose_.translation() += v * kDt;
+    if (w.norm() > 1e-9) {
+      const Eigen::AngleAxisd step(w.norm() * kDt, w.normalized());
+      target_pose_.linear() = step.toRotationMatrix() * target_pose_.linear();
+    }
+
+    // 3. Error between target and real pose (position and orientation)
+    Eigen::Matrix<double, 6, 1> error;
+    error.head<3>() = target_pose_.translation() - current_pose.translation();
+    const Eigen::AngleAxisd rot_error(target_pose_.linear() * current_pose.linear().transpose());
+    error.tail<3>() = rot_error.angle() * rot_error.axis();
+
+    // 4. Closed loop: commanded velocity + correction proportional to the error
+    const Eigen::Matrix<double, 6, 1> twist_total = twist_ + position_gain_ * error;
+
+    // 5. Damping only near a singularity
+    const Eigen::MatrixXd JJt = J * J.transpose();
+    const double manipulability = std::sqrt(JJt.determinant());
+    double damping = 0.0;
+    if (manipulability < manipulability_threshold_) {
+      const double ratio = manipulability / manipulability_threshold_;
+      damping = max_damping_ * std::sqrt(1.0 - ratio * ratio);
+    }
+    const Eigen::MatrixXd J_pinv_damped =
+      J.transpose() * (JJt + damping * damping * Eigen::MatrixXd::Identity(6, 6)).inverse();
+
+    // 6. Main task
+    qdot = J_pinv_damped * twist_total;
+
+    // 7. Secondary task with an exact null-space projector
+    const Eigen::MatrixXd J_pinv_exact = J.completeOrthogonalDecomposition().pseudoInverse();
+    const Eigen::MatrixXd N = Eigen::MatrixXd::Identity(n, n) - J_pinv_exact * J;
+    qdot += N * (nullspace_gain_ * (q_home_ - q_));
+
+    // 8. Speed limit, all joints scaled together
+    const double fastest = qdot.cwiseAbs().maxCoeff();
+    if (fastest > max_joint_velocity_) {
+      qdot *= max_joint_velocity_ / fastest;
+    }
+
+    publish(qdot);
+  }
+
+  void publish(const Eigen::VectorXd & qdot)
+  {
     std_msgs::msg::Float64MultiArray command;
     command.data.assign(qdot.data(), qdot.data() + qdot.size());
     command_pub_->publish(command);
   }
 
   // Settings
-  double damping_;
+  double max_damping_;
+  double manipulability_threshold_;
+  double position_gain_;
   double max_joint_velocity_;
   double nullspace_gain_;
   double command_timeout_;
@@ -136,10 +181,12 @@ private:
   Eigen::VectorXd q_;
   Eigen::VectorXd q_home_;
   Eigen::Matrix<double, 6, 1> twist_ = Eigen::Matrix<double, 6, 1>::Zero();
+  Eigen::Isometry3d target_pose_ = Eigen::Isometry3d::Identity();
   rclcpp::Time last_command_time_;
   bool model_ready_ = false;
   bool joints_received_ = false;
   bool has_command_ = false;
+  bool tracking_ = false;
 
   // ROS interfaces
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr description_sub_;
