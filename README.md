@@ -7,7 +7,7 @@ picks it up and places it on a shelf, guided only by ArUco markers.
 Every cycle starts from a new random layout, and the accuracy is benchmarked against the
 simulator's ground truth.
 
-Written from scratch in C++ on ROS 2 Jazzy and Gazebo Harmonic, without MoveIt.
+Written from scratch in C++ on ROS 2 Jazzy and Gazebo Harmonic.
 
 ![Demo](docs/demo.gif)
 
