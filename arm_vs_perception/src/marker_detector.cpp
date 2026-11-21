@@ -160,14 +160,14 @@ private:
   void publish_pose(
     const std_msgs::msg::Header & header, const cv::Vec3d & rvec, const cv::Vec3d & tvec)
   {
-    cv::Mat R;
-    cv::Rodrigues(rvec, R);
-    tf2::Matrix3x3 rotation(
-      R.at<double>(0, 0), R.at<double>(0, 1), R.at<double>(0, 2),
-      R.at<double>(1, 0), R.at<double>(1, 1), R.at<double>(1, 2),
-      R.at<double>(2, 0), R.at<double>(2, 1), R.at<double>(2, 2));
-    tf2::Quaternion q;
-    rotation.getRotation(q);
+    // Rotation vector (axis * angle) -> quaternion directly.
+    // Going through a rotation matrix is unstable near 180 degrees, which is exactly
+    // our case: the camera looks down and the marker faces up.
+    const double angle = cv::norm(rvec);
+    tf2::Quaternion q(0.0, 0.0, 0.0, 1.0);
+    if (angle > 1e-9) {
+      q.setRotation(tf2::Vector3(rvec[0] / angle, rvec[1] / angle, rvec[2] / angle), angle);
+    }
 
     geometry_msgs::msg::PoseStamped pose;
     pose.header = header;

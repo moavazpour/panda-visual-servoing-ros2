@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <memory>
 #include <random>
 #include <string>
@@ -15,6 +16,7 @@
 #include "sensor_msgs/msg/joint_state.hpp"
 #include "std_msgs/msg/bool.hpp"
 #include "std_msgs/msg/float64_multi_array.hpp"
+#include "std_msgs/msg/string.hpp"
 #include "tf2/exceptions.h"
 #include "tf2_eigen/tf2_eigen.hpp"
 #include "tf2_ros/buffer.h"
@@ -82,7 +84,11 @@ public:
     fast_speed_ = declare_parameter("fast_speed", 0.08);         // [m/s]
     slow_speed_ = declare_parameter("slow_speed", 0.03);         // [m/s]
     max_angular_ = declare_parameter("max_angular_speed", 0.4);  // [rad/s]
+
+    // Gripper
     open_width_ = declare_parameter("open_width", 0.04);         // [m]
+    squeeze_time_ = declare_parameter("squeeze_time", 1.0);      // [s]
+    grip_squeeze_ = declare_parameter("grip_squeeze", 0.001);    // hold target inside contact [m]
 
     // Perception
     observe_time_ = declare_parameter("observe_time", 1.0);      // [s]
@@ -119,7 +125,9 @@ public:
       [this](const sensor_msgs::msg::JointState & msg) {
         for (size_t i = 0; i < msg.name.size(); ++i) {
           if (msg.name[i] == "panda_finger_joint1") {
-            finger_position_ = msg.position[i];
+            finger1_ = msg.position[i];
+          } else if (msg.name[i] == "panda_finger_joint2") {
+            finger2_ = msg.position[i];
           }
         }
       });
@@ -146,6 +154,7 @@ public:
     gripper_pub_ = create_publisher<std_msgs::msg::Float64MultiArray>(
       "/gripper_controller/commands", 10);
     servo_enable_pub_ = create_publisher<std_msgs::msg::Bool>("/servo_enable", 10);
+    result_pub_ = create_publisher<std_msgs::msg::String>("/cycle_result", 10);
     set_pose_client_ = create_client<SetEntityPose>("/world/" + world_name + "/set_pose");
 
     timer_ = create_wall_timer(20ms, [this]() {step();});
@@ -197,6 +206,11 @@ private:
     }
     publish_servo_enable();
 
+    // While the cube is in the hand, keep it centred between the fingers
+    if (holding_cube_) {
+      hold_centered();
+    }
+
     switch (state_) {
       // ---------- New cycle ----------
       case State::START:
@@ -205,7 +219,7 @@ private:
         }
         break;
 
-            case State::RANDOMIZE:
+      case State::RANDOMIZE:
         stop();
         if (!layout_sent_) {
           // A freshly started node needs a moment to discover the service
@@ -275,13 +289,24 @@ private:
 
       case State::CLOSE_GRIPPER:
         stop();
-        command_gripper(0.0);
-        if (seconds_in_state() > 1.5) {
-          if (finger_position_ < 0.005) {
-            RCLCPP_ERROR(get_logger(), "Fingers closed on nothing, the cube was missed");
-            finish_cycle(false, 0.0);
-          } else {
-            set_state(State::LIFT);
+        if (seconds_in_state() < squeeze_time_) {
+          // Phase 1: both fingers close together
+          command_gripper(0.0);
+        } else {
+          // Phase 2: hold_centered() takes over and pulls the cube to the centre
+          holding_cube_ = true;
+          if (seconds_in_state() > squeeze_time_ + 1.0) {
+            RCLCPP_INFO(
+              get_logger(),
+              "Fingers %.1f mm / %.1f mm, opening %.1f mm, cube %.1f mm off centre",
+              finger1_ * 1000.0, finger2_ * 1000.0, (finger1_ + finger2_) * 1000.0,
+              (finger1_ - finger2_) / 2.0 * 1000.0);
+            if (finger1_ + finger2_ < 0.01) {
+              RCLCPP_ERROR(get_logger(), "Fingers closed on nothing, the cube was missed");
+              finish_cycle(false, 0.0);
+            } else {
+              set_state(State::LIFT);
+            }
           }
         }
         break;
@@ -398,6 +423,8 @@ private:
     switch (s) {
       case State::START:
         servo_enabled_ = false;
+        holding_cube_ = false;
+        cycle_start_ = now();
         command_gripper(open_width_);
         break;
       case State::RANDOMIZE:
@@ -414,14 +441,23 @@ private:
       case State::OPEN_GRIPPER:
         servo_enabled_ = false;  // this node takes over from here
         break;
+      case State::CLOSE_GRIPPER:
+        holding_cube_ = false;
+        break;
       case State::LOOK_FOR_PLACE:
       case State::MEASURE_PLACE:
         place_samples_.reset();
         collecting_place_ = true;
         break;
+      case State::RELEASE:
+        holding_cube_ = false;   // stop centring, let the fingers open
+        break;
       case State::VERIFY:
         verify_samples_.reset();
         collecting_verify_ = true;
+        break;
+      case State::IDLE:
+        holding_cube_ = false;
         break;
       default:
         break;
@@ -444,6 +480,17 @@ private:
       "===== Cycle %d: %s | success %d/%d (%.0f%%) | mean error %.1f mm | max error %.1f mm =====",
       cycles_, success ? "SUCCESS" : "FAILED", successes_, cycles_,
       100.0 * successes_ / cycles_, mean_error * 1000.0, max_error_ * 1000.0);
+
+    // Report the cycle, so an external tool can benchmark it
+    char json[256];
+    std::snprintf(
+      json, sizeof(json),
+      "{\"cycle\": %d, \"success\": %s, \"estimated_error_mm\": %.2f, \"duration_s\": %.1f}",
+      cycles_, success ? "true" : "false", error * 1000.0, (now() - cycle_start_).seconds());
+    std_msgs::msg::String result;
+    result.data = json;
+    result_pub_->publish(result);
+
     set_state(loop_ ? State::START : State::IDLE);
   }
 
@@ -468,17 +515,6 @@ private:
 
   void randomize_scene()
   {
-    pending_requests_ = 0;
-    request_failed_ = false;
-
-    if (!set_pose_client_->service_is_ready()) {
-      RCLCPP_ERROR(
-        get_logger(), "Service %s not available. Is the bridge running?",
-        set_pose_client_->get_service_name());
-      request_failed_ = true;
-      return;
-    }
-
     std::uniform_real_distribution<double> cube_x(kCubeXMin, kCubeXMax);
     std::uniform_real_distribution<double> cube_y(-kCubeYMax, kCubeYMax);
     std::uniform_real_distribution<double> shelf_x(kShelfXMin, kShelfXMax);
@@ -718,10 +754,21 @@ private:
     }
   }
 
+  // Software version of the gear that couples the real Franka fingers.
+  // Both fingers get the same target, slightly inside their average position.
+  // The finger the cube has moved towards is further from that target and pushes
+  // harder, the other one backs off, so the cube is pushed back to the centre.
+  void hold_centered()
+  {
+    const double target = (finger1_ + finger2_) / 2.0 - grip_squeeze_;
+    command_gripper(std::max(target, 0.0));
+  }
+
+  // Same target for both fingers
   void command_gripper(double finger_position)
   {
     std_msgs::msg::Float64MultiArray msg;
-    msg.data = {finger_position};
+    msg.data = {finger_position, finger_position};
     gripper_pub_->publish(msg);
   }
 
@@ -748,6 +795,8 @@ private:
   double slow_speed_;
   double max_angular_;
   double open_width_;
+  double squeeze_time_;
+  double grip_squeeze_;
   double observe_time_;
   int min_samples_;
   bool loop_;
@@ -759,14 +808,17 @@ private:
   State state_ = State::START;
   rclcpp::Time state_start_;
   rclcpp::Time wait_started_;
+  rclcpp::Time cycle_start_;
   rclcpp::Time last_motion_time_;
   double last_hand_z_ = 1e9;
   bool servo_enabled_ = false;
+  bool holding_cube_ = false;
 
   // Inputs
   bool has_cube_ = false;
   bool servo_holding_ = false;
-  double finger_position_ = 0.0;
+  double finger1_ = 0.0;
+  double finger2_ = 0.0;
   std::string camera_frame_ = "camera_optical_frame";
   bool collecting_place_ = false;
   bool collecting_verify_ = false;
@@ -787,9 +839,9 @@ private:
 
   // Randomization and statistics
   std::mt19937 rng_;
+  bool layout_sent_ = false;
   int pending_requests_ = 0;
   bool request_failed_ = false;
-  bool layout_sent_ = false;
   int cycles_ = 0;
   int successes_ = 0;
   double error_sum_ = 0.0;
@@ -808,6 +860,7 @@ private:
   rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr twist_pub_;
   rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr gripper_pub_;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr servo_enable_pub_;
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr result_pub_;
   rclcpp::Client<SetEntityPose>::SharedPtr set_pose_client_;
   rclcpp::TimerBase::SharedPtr timer_;
 };

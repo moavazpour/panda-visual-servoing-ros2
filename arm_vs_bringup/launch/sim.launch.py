@@ -45,15 +45,21 @@ def generate_launch_description():
         arguments=['-topic', 'robot_description', '-name', 'panda'],
     )
 
-    # 3. Bridge: clock, camera, and the service that moves objects
+    # 3. Bridge between Gazebo and ROS
     bridge = Node(
         package='ros_gz_bridge',
         executable='parameter_bridge',
         arguments=[
+            # Simulation clock
             '/clock@rosgraph_msgs/msg/Clock[gz.msgs.Clock',
+            # Wrist camera
             '/wrist_camera/image@sensor_msgs/msg/Image[gz.msgs.Image',
             '/wrist_camera/camera_info@sensor_msgs/msg/CameraInfo[gz.msgs.CameraInfo',
+            # Move objects (random layouts)
             '/world/vs_world/set_pose@ros_gz_interfaces/srv/SetEntityPose',
+            # Ground truth poses (benchmark)
+            '/model/aruco_cube/pose@tf2_msgs/msg/TFMessage[gz.msgs.Pose_V',
+            '/model/place_shelf/pose@tf2_msgs/msg/TFMessage[gz.msgs.Pose_V',
         ],
     )
 

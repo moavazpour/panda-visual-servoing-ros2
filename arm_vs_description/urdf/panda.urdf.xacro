@@ -3,8 +3,8 @@
 
   <xacro:arg name="controllers_file" default=""/>
 
-  <!-- 1. Panda model with masses and inertias -->
-  <xacro:include filename="$(find moveit_resources_panda_description)/urdf/panda.urdf.xacro"/>
+  <!-- 1. Panda arm with masses and inertias; local copy without the finger mimic tag -->
+  <xacro:include filename="$(find arm_vs_description)/urdf/panda_arm.xacro"/>
 
   <!-- 2. Fix the robot base to the world -->
   <link name="world"/>
@@ -61,13 +61,23 @@
     </sensor>
   </gazebo>
 
-  <!-- 4. ros2_control joints -->
+  <!-- 4. ros2_control: 7 arm joints and 2 independently commanded fingers -->
   <xacro:macro name="arm_joint" params="name initial">
     <joint name="${name}">
       <command_interface name="position"/>
       <command_interface name="velocity"/>
       <state_interface name="position">
         <param name="initial_value">${initial}</param>
+      </state_interface>
+      <state_interface name="velocity"/>
+    </joint>
+  </xacro:macro>
+
+  <xacro:macro name="finger_joint" params="name">
+    <joint name="${name}">
+      <command_interface name="position"/>
+      <state_interface name="position">
+        <param name="initial_value">0.04</param>
       </state_interface>
       <state_interface name="velocity"/>
     </joint>
@@ -84,21 +94,8 @@
     <xacro:arm_joint name="panda_joint5" initial="0.0"/>
     <xacro:arm_joint name="panda_joint6" initial="1.571"/>
     <xacro:arm_joint name="panda_joint7" initial="0.785"/>
-   
-        <!-- Gripper: finger 1 is commanded, finger 2 mimics it (state only) -->
-    <joint name="panda_finger_joint1">
-      <command_interface name="position"/>
-      <state_interface name="position">
-        <param name="initial_value">0.04</param>
-      </state_interface>
-      <state_interface name="velocity"/>
-    </joint>
-    <joint name="panda_finger_joint2">
-      <state_interface name="position">
-        <param name="initial_value">0.04</param>
-      </state_interface>
-      <state_interface name="velocity"/>
-    </joint>
+    <xacro:finger_joint name="panda_finger_joint1"/>
+    <xacro:finger_joint name="panda_finger_joint2"/>
   </ros2_control>
 
   <!-- 5. Plugin that connects ros2_control to Gazebo -->
