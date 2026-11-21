@@ -7,7 +7,7 @@ picks it up and places it on a shelf, guided only by ArUco markers.
 Every cycle starts from a new random layout, and the accuracy is benchmarked against the
 simulator's ground truth.
 
-Written from scratch in C++ on ROS 2 Jazzy and Gazebo Harmonic.
+Written from scratch in C++ on ROS 2 Jazzy and Gazebo Harmonic, without MoveIt.
 
 ![Demo](docs/demo.gif)
 
@@ -18,8 +18,8 @@ Written from scratch in C++ on ROS 2 Jazzy and Gazebo Harmonic.
 - **Position-based visual servoing (PBVS)** in the robot base frame, with a low-pass filter,
   outlier rejection, a Schmitt trigger between moving and holding, and 4-fold cube symmetry
 - **Cartesian velocity control** written from scratch with KDL and Eigen: damped
-  least-squares inverse kinematics near singularities, a null-space task that keeps the arm
-  near its home posture, and closed-loop pose feedback with anti-windup
+  least-squares inverse kinematics near singularities, an exact null-space projector for
+  secondary tasks, and closed-loop pose feedback with anti-windup
 - **Pick-and-place state machine** with contact detection, a two-step place localization
   (coarse, then close-up) and a camera check of the result
 - **Probing grasp**: the fingers close slowly and stop when they feel the cube, so it is not
@@ -35,8 +35,9 @@ Written from scratch in C++ on ROS 2 Jazzy and Gazebo Harmonic.
 
 ## Results
 
-75 consecutive cycles with random cube and shelf poses. The error is the horizontal distance
-between the cube centre and the shelf centre, taken from Gazebo's ground truth.
+75 consecutive cycles with random cube and shelf poses (version D, see below). The error is
+the horizontal distance between the cube centre and the shelf centre, taken from Gazebo's
+ground truth. The probing grasp and the random elbow swivel were added after this benchmark.
 
 | Metric | Value |
 |---|---|
@@ -82,31 +83,47 @@ shelf, which made the robot overestimate its own error by about 3 mm.
 
 ```mermaid
 flowchart LR
-    CAM[Wrist camera<br/>640x480, 30 Hz] --> D0[marker_detector<br/>cube, id 0]
-    CAM --> D1[marker_detector<br/>shelf, id 1]
+    subgraph SIM[Gazebo + ros2_control, 500 Hz]
+        CAM[Wrist camera<br/>640x480, 30 Hz]
+        ARM[Arm velocity controller]
+        GRIP[Gripper position controller]
+        WORLD[World: cube and shelf]
+    end
+
+    CAM -- /wrist_camera/image --> D0[marker_detector<br/>cube, id 0]
+    CAM -- /wrist_camera/image --> D1[marker_detector<br/>shelf, id 1]
     D0 -- /marker_pose --> VS[visual_servo]
     D0 -- /marker_pose --> PP[pick_and_place]
     D1 -- /place_marker_pose --> PP
-    VS -- /cube_pose<br/>/servo_holding --> PP
+    VS -- /cube_pose, /servo_holding --> PP
     PP -- /servo_enable --> VS
     VS -- /target_twist --> CV[cartesian_velocity_node<br/>100 Hz]
-    PP -- /target_twist --> CV
-    CV -- joint velocities --> GZ[Gazebo + ros2_control<br/>500 Hz]
-    PP -- finger targets --> GZ
-    PP -- random layout --> GZ
-    GZ -- ground truth poses --> BR[benchmark_recorder]
+    PP -- /target_twist, /elbow_swivel --> CV
+    CV -- /velocity_controller/commands --> ARM
+    PP -- /gripper_controller/commands --> GRIP
+    PP -- set_pose service --> WORLD
+    SIM -- /joint_states --> CV
+    SIM -- /joint_states --> PP
+    WORLD -- ground truth poses --> BR[benchmark_recorder]
     PP -- /cycle_result --> BR
 ```
 
+The task node and the visual servo both send hand velocities on `/target_twist`; the task
+node turns the servo on only for the approach to the cube and drives the hand itself in all
+other phases. The marker poses are converted to the robot base frame through TF, using the
+joint angles at the time the image was taken.
+
 One cycle:
 
-1. Move to an overview pose and place the cube and the shelf at random poses
-2. Measure the shelf position while the hand is still empty
+1. Pick a random elbow swivel, move to an overview pose and place the cube and the shelf at
+   random poses
+2. Measure the shelf position from above while the hand is still empty
 3. Visual servo: bring the camera 20 cm above the cube marker and wait until it is still
-4. Open the gripper, descend until the target height or contact, close and centre the cube
+4. Descend, close the fingers slowly until both touch the cube, re-centre the hand if the
+   cube is off centre, then grip
 5. Lift, move above the shelf and measure its marker again from close by
 6. Lower the cube onto the shelf, release and retreat
-7. Look at the cube from above and report the placement error
+7. Look at the cube from the same distance as the shelf marker and report the placement error
 
 ## Packages
 
@@ -169,6 +186,12 @@ ros2 launch arm_vs_servoing servo.launch.py
 - The simulated fingers are not mechanically coupled like the real Franka Hand; the
   coupling is done in software (see above).
 - Simulation only; the camera has no noise, motion blur or lens distortion.
+
+## Acknowledgements
+
+The Panda meshes and the base URDF come from
+[`moveit_resources_panda_description`](https://github.com/moveit/moveit_resources). The URDF is a
+local copy with the finger `mimic` tag removed; MoveIt itself is not used.
 
 ## License
 
