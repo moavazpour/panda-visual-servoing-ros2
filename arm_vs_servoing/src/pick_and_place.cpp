@@ -74,7 +74,7 @@ public:
     grasp_height_offset_ = declare_parameter("grasp_height_offset", 0.015);  // [m]
     pregrasp_height_ = declare_parameter("pregrasp_height", 0.10);  // [m]
     lift_height_ = declare_parameter("lift_height", 0.15);       // [m]
-    standoff_ = declare_parameter("standoff", 0.20);             // camera above place marker [m]
+    standoff_ = declare_parameter("standoff", 0.20);             // camera above a marker [m]
     place_approach_height_ = declare_parameter("place_approach_height", 0.10);  // [m]
     place_push_ = declare_parameter("place_push", 0.01);         // aim below contact [m]
     retreat_height_ = declare_parameter("retreat_height", 0.15);  // [m]
@@ -186,12 +186,13 @@ private:
     PLACE_DESCEND,
     RELEASE,
     RETREAT,
+    GO_TO_VERIFY,
     VERIFY,
     IDLE
   };
 
   // Random layout ranges [m]: both markers must be visible from the scan pose
-  static constexpr double kCubeXMin = 0.40, kCubeXMax = 0.50, kCubeYMax = 0.15;
+  static constexpr double kCubeXMin = 0.40, kCubeXMax = 0.47, kCubeYMax = 0.15;
   static constexpr double kShelfXMin = 0.40, kShelfXMax = 0.48, kShelfYMax = 0.13;
   static constexpr double kCubeZ = 0.176;   // table top 0.15 + half cube + 1 mm
   static constexpr double kShelfZ = 0.20;   // table top 0.15 + half shelf height
@@ -244,8 +245,15 @@ private:
         break;
 
       case State::SETTLE:
+        // The hand is still empty: a good moment to find the shelf (coarse estimate)
         stop();
         if (seconds_in_state() > 2.0) {
+          if (place_samples_.count >= min_samples_) {
+            place_estimate_ = place_samples_.mean();
+            has_place_ = true;
+          } else {
+            RCLCPP_WARN(get_logger(), "Shelf not seen before the pick, will look for it later");
+          }
           set_state(State::WAIT_FOR_CUBE);
         }
         break;
@@ -313,11 +321,17 @@ private:
 
       case State::LIFT:
         if (go_to(lift_pose_, slow_speed_)) {
-          set_state(State::GO_TO_SCAN);
+          if (has_place_) {
+            // Shelf already known: go straight above it
+            observe_pose_ = camera_above(place_estimate_, standoff_);
+            set_state(State::GO_ABOVE_PLACE);
+          } else {
+            set_state(State::GO_TO_SCAN);
+          }
         }
         break;
 
-      // ---------- Find the place location: coarse, then fine ----------
+      // ---------- Find the place location (fallback if it was not seen before) ----------
       case State::GO_TO_SCAN:
         if (go_to(scan_pose_, fast_speed_)) {
           set_state(State::LOOK_FOR_PLACE);
@@ -328,7 +342,7 @@ private:
         stop();
         if (seconds_in_state() > observe_time_ && place_samples_.count >= min_samples_) {
           place_estimate_ = place_samples_.mean();
-          observe_pose_ = camera_above(place_estimate_);
+          observe_pose_ = camera_above(place_estimate_, standoff_);
           set_state(State::GO_ABOVE_PLACE);
         } else if (seconds_in_state() > 5.0) {
           RCLCPP_ERROR(get_logger(), "Place marker not visible from the scan pose");
@@ -336,6 +350,7 @@ private:
         }
         break;
 
+      // ---------- Measure the place location from close by ----------
       case State::GO_ABOVE_PLACE:
         if (go_to(observe_pose_, fast_speed_)) {
           set_state(State::MEASURE_PLACE);
@@ -377,6 +392,15 @@ private:
 
       case State::RETREAT:
         if (go_to(retreat_pose_, slow_speed_)) {
+          // Look at the cube from the same distance the shelf marker was measured from:
+          // the camera's depth error is then the same in both measurements and cancels.
+          verify_pose_ = camera_above(place_estimate_, standoff_ + cube_size_);
+          set_state(State::GO_TO_VERIFY);
+        }
+        break;
+
+      case State::GO_TO_VERIFY:
+        if (go_to(verify_pose_, slow_speed_)) {
           set_state(State::VERIFY);
         }
         break;
@@ -404,7 +428,8 @@ private:
     static const char * names[] = {
       "START", "RANDOMIZE", "SETTLE", "WAIT_FOR_CUBE", "OPEN_GRIPPER", "PRE_GRASP",
       "DESCEND", "CLOSE_GRIPPER", "LIFT", "GO_TO_SCAN", "LOOK_FOR_PLACE", "GO_ABOVE_PLACE",
-      "MEASURE_PLACE", "PRE_PLACE", "PLACE_DESCEND", "RELEASE", "RETREAT", "VERIFY", "IDLE"};
+      "MEASURE_PLACE", "PRE_PLACE", "PLACE_DESCEND", "RELEASE", "RETREAT", "GO_TO_VERIFY",
+      "VERIFY", "IDLE"};
     RCLCPP_INFO(
       get_logger(), "%s -> %s",
       names[static_cast<int>(state_)], names[static_cast<int>(next)]);
@@ -424,6 +449,7 @@ private:
       case State::START:
         servo_enabled_ = false;
         holding_cube_ = false;
+        has_place_ = false;
         cycle_start_ = now();
         command_gripper(open_width_);
         break;
@@ -431,6 +457,12 @@ private:
         layout_sent_ = false;
         pending_requests_ = 0;
         request_failed_ = false;
+        break;
+      case State::SETTLE:
+      case State::LOOK_FOR_PLACE:
+      case State::MEASURE_PLACE:
+        place_samples_.reset();
+        collecting_place_ = true;
         break;
       case State::WAIT_FOR_CUBE:
         has_cube_ = false;
@@ -443,11 +475,6 @@ private:
         break;
       case State::CLOSE_GRIPPER:
         holding_cube_ = false;
-        break;
-      case State::LOOK_FOR_PLACE:
-      case State::MEASURE_PLACE:
-        place_samples_.reset();
-        collecting_place_ = true;
         break;
       case State::RELEASE:
         holding_cube_ = false;   // stop centring, let the fingers open
@@ -624,8 +651,8 @@ private:
     return best;
   }
 
-  // Hand pose that puts the camera 'standoff' above a marker, looking straight down
-  Eigen::Isometry3d camera_above(const Eigen::Isometry3d & marker)
+  // Hand pose that puts the camera 'height' above a marker, looking straight down
+  Eigen::Isometry3d camera_above(const Eigen::Isometry3d & marker, double height)
   {
     Eigen::Isometry3d T_camera_hand = Eigen::Isometry3d::Identity();
     try {
@@ -640,7 +667,7 @@ private:
     double best_angle = 1e9;
     for (int k = 0; k < 4; ++k) {
       Eigen::Isometry3d goal = Eigen::Isometry3d::Identity();
-      goal.translate(Eigen::Vector3d(0.0, 0.0, standoff_));
+      goal.translate(Eigen::Vector3d(0.0, 0.0, height));
       goal.rotate(Eigen::AngleAxisd(k * M_PI / 2.0, Eigen::Vector3d::UnitZ()));
       goal.rotate(Eigen::AngleAxisd(M_PI, Eigen::Vector3d::UnitX()));
 
@@ -813,6 +840,7 @@ private:
   double last_hand_z_ = 1e9;
   bool servo_enabled_ = false;
   bool holding_cube_ = false;
+  bool has_place_ = false;
 
   // Inputs
   bool has_cube_ = false;
@@ -836,6 +864,7 @@ private:
   Eigen::Isometry3d place_pose_ = Eigen::Isometry3d::Identity();
   Eigen::Isometry3d preplace_pose_ = Eigen::Isometry3d::Identity();
   Eigen::Isometry3d retreat_pose_ = Eigen::Isometry3d::Identity();
+  Eigen::Isometry3d verify_pose_ = Eigen::Isometry3d::Identity();
 
   // Randomization and statistics
   std::mt19937 rng_;

@@ -1,0 +1,30 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    container: ros:jazzy
+
+    steps:
+      - name: Check out the repository into a colcon workspace
+        uses: actions/checkout@v4
+        with:
+          path: src/panda_visual_servoing
+
+      - name: Install dependencies
+        run: |
+          apt-get update
+          rosdep update --rosdistro jazzy
+          rosdep install --from-paths src --ignore-src --rosdistro jazzy -y
+
+      - name: Build
+        shell: bash
+        run: |
+          source /opt/ros/jazzy/setup.bash
+          colcon build --event-handlers console_cohesion+

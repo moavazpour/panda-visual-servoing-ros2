@@ -33,7 +33,9 @@ install(TARGETS visual_servo pick_and_place
 install(DIRECTORY launch
   DESTINATION share/${PROJECT_NAME})
 
-install(PROGRAMS scripts/benchmark_recorder.py
+install(PROGRAMS
+  scripts/benchmark_recorder.py
+  scripts/analyze_benchmark.py
   DESTINATION lib/${PROJECT_NAME})
 
 ament_package()
