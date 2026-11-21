@@ -15,6 +15,7 @@
 #include "ros_gz_interfaces/srv/set_entity_pose.hpp"
 #include "sensor_msgs/msg/joint_state.hpp"
 #include "std_msgs/msg/bool.hpp"
+#include "std_msgs/msg/float64.hpp"
 #include "std_msgs/msg/float64_multi_array.hpp"
 #include "std_msgs/msg/string.hpp"
 #include "tf2/exceptions.h"
@@ -88,6 +89,13 @@ public:
     // Gripper
     open_width_ = declare_parameter("open_width", 0.04);         // [m]
     squeeze_time_ = declare_parameter("squeeze_time", 1.0);      // [s]
+
+    // Probing grasp: close slowly, feel where the cube is, re-centre the hand, then grip
+    probe_speed_ = declare_parameter("probe_speed", 0.02);       // finger speed [m/s]
+    contact_force_ = declare_parameter("contact_force", 0.2);    // finger force = touching [N]
+    contact_lag_ = declare_parameter("contact_lag", 0.002);      // finger blocked behind its target [m]
+    centre_tolerance_ = declare_parameter("centre_tolerance", 0.001);  // [m]
+    max_recentring_ = declare_parameter("max_recentring", 2);
     grip_squeeze_ = declare_parameter("grip_squeeze", 0.001);    // hold target inside contact [m]
 
     // Perception
@@ -98,6 +106,9 @@ public:
     loop_ = declare_parameter("loop", true);
     randomize_ = declare_parameter("randomize", true);
     min_separation_ = declare_parameter("min_separation", 0.20);  // cube <-> shelf centres [m]
+    // Arm posture: the 7th joint lets the elbow swing without moving the hand.
+    // Every cycle gets a random elbow swivel inside this range [rad].
+    swivel_range_ = declare_parameter("swivel_range", 0.7);
     success_tolerance_ = declare_parameter("success_tolerance", 0.02);  // [m]
     const std::string world_name = declare_parameter("world_name", std::string("vs_world"));
     const int seed = declare_parameter("seed", -1);
@@ -124,10 +135,13 @@ public:
       "/joint_states", 10,
       [this](const sensor_msgs::msg::JointState & msg) {
         for (size_t i = 0; i < msg.name.size(); ++i) {
+          const bool has_effort = i < msg.effort.size();
           if (msg.name[i] == "panda_finger_joint1") {
             finger1_ = msg.position[i];
+            effort1_ = has_effort ? msg.effort[i] : NAN;
           } else if (msg.name[i] == "panda_finger_joint2") {
             finger2_ = msg.position[i];
+            effort2_ = has_effort ? msg.effort[i] : NAN;
           }
         }
       });
@@ -154,6 +168,7 @@ public:
     gripper_pub_ = create_publisher<std_msgs::msg::Float64MultiArray>(
       "/gripper_controller/commands", 10);
     servo_enable_pub_ = create_publisher<std_msgs::msg::Bool>("/servo_enable", 10);
+    swivel_pub_ = create_publisher<std_msgs::msg::Float64>("/elbow_swivel", 10);
     result_pub_ = create_publisher<std_msgs::msg::String>("/cycle_result", 10);
     set_pose_client_ = create_client<SetEntityPose>("/world/" + world_name + "/set_pose");
 
@@ -176,6 +191,8 @@ private:
     OPEN_GRIPPER,
     PRE_GRASP,
     DESCEND,
+    PROBE,
+    RECENTRE,
     CLOSE_GRIPPER,
     LIFT,
     GO_TO_SCAN,
@@ -206,6 +223,7 @@ private:
       return;
     }
     publish_servo_enable();
+    publish_swivel();
 
     // While the cube is in the hand, keep it centred between the fingers
     if (holding_cube_) {
@@ -291,7 +309,57 @@ private:
 
       case State::DESCEND:
         if (go_to(grasp_pose_, slow_speed_) || contact_detected(grasp_pose_)) {
+          set_state(State::PROBE);
+        }
+        break;
+
+      case State::PROBE:
+        // Close both fingers slowly. A finger that touches the cube stops where it is,
+        // so the cube is not pushed. When both touch, we know where the cube is in the hand.
+        stop();
+        probe_finger(finger1_, effort1_, probe_target1_, touched1_, touch1_);
+        probe_finger(finger2_, effort2_, probe_target2_, touched2_, touch2_);
+        command_fingers(probe_target1_, probe_target2_);
+
+        if (touched1_ && touched2_) {
+          // Finger 1 moves along the hand's +y axis, finger 2 along -y.
+          // The cube spans from -touch2 to +touch1, so its centre is at (touch1 - touch2) / 2.
+          const double offset = (touch1_ - touch2_) / 2.0;
+          if (recentrings_ == 0) {
+            grasp_offset_ = offset;
+          }
+          RCLCPP_INFO(
+            get_logger(), "Fingers touch the cube: width %.1f mm, cube %.1f mm off centre",
+            (touch1_ + touch2_) * 1000.0, offset * 1000.0);
+
+          if (std::abs(offset) > centre_tolerance_ && recentrings_ < max_recentring_) {
+            // Move the hand sideways by the offset, then feel again
+            const Eigen::Vector3d shift = current_hand_pose().linear().col(1) * offset;
+            recentre_pose_ = current_hand_pose();
+            recentre_pose_.translation() += shift;
+            lift_pose_.translation() += shift;
+            ++recentrings_;
+            set_state(State::RECENTRE);
+          } else {
+            set_state(State::CLOSE_GRIPPER);
+          }
+        } else if (finger1_ + finger2_ < 0.01) {
+          RCLCPP_ERROR(get_logger(), "Fingers closed on nothing, the cube was missed");
+          finish_cycle(false, 0.0);
+        } else if (seconds_in_state() > 6.0) {
+          RCLCPP_WARN(get_logger(), "Probing took too long, gripping anyway");
           set_state(State::CLOSE_GRIPPER);
+        }
+        break;
+
+      case State::RECENTRE:
+        // Open first, so no finger drags the cube, then move the hand
+        command_gripper(open_width_);
+        if (seconds_in_state() < 0.5) {
+          stop();
+        } else if (go_to(recentre_pose_, slow_speed_, 0.0003) || seconds_in_state() > 4.0) {
+          // The correction is only a few mm, so it needs a finer tolerance than other moves
+          set_state(State::PROBE);
         }
         break;
 
@@ -427,7 +495,7 @@ private:
   {
     static const char * names[] = {
       "START", "RANDOMIZE", "SETTLE", "WAIT_FOR_CUBE", "OPEN_GRIPPER", "PRE_GRASP",
-      "DESCEND", "CLOSE_GRIPPER", "LIFT", "GO_TO_SCAN", "LOOK_FOR_PLACE", "GO_ABOVE_PLACE",
+      "DESCEND", "PROBE", "RECENTRE", "CLOSE_GRIPPER", "LIFT", "GO_TO_SCAN", "LOOK_FOR_PLACE", "GO_ABOVE_PLACE",
       "MEASURE_PLACE", "PRE_PLACE", "PLACE_DESCEND", "RELEASE", "RETREAT", "GO_TO_VERIFY",
       "VERIFY", "IDLE"};
     RCLCPP_INFO(
@@ -451,6 +519,7 @@ private:
         holding_cube_ = false;
         has_place_ = false;
         cycle_start_ = now();
+        choose_swivel();
         command_gripper(open_width_);
         break;
       case State::RANDOMIZE:
@@ -472,6 +541,14 @@ private:
         break;
       case State::OPEN_GRIPPER:
         servo_enabled_ = false;  // this node takes over from here
+        recentrings_ = 0;
+        grasp_offset_ = 0.0;
+        break;
+      case State::PROBE:
+        touched1_ = false;
+        touched2_ = false;
+        probe_target1_ = finger1_;
+        probe_target2_ = finger2_;
         break;
       case State::CLOSE_GRIPPER:
         holding_cube_ = false;
@@ -512,8 +589,10 @@ private:
     char json[256];
     std::snprintf(
       json, sizeof(json),
-      "{\"cycle\": %d, \"success\": %s, \"estimated_error_mm\": %.2f, \"duration_s\": %.1f}",
-      cycles_, success ? "true" : "false", error * 1000.0, (now() - cycle_start_).seconds());
+      "{\"cycle\": %d, \"success\": %s, \"estimated_error_mm\": %.2f, \"duration_s\": %.1f, "
+      "\"swivel_deg\": %.1f, \"grasp_offset_mm\": %.2f}",
+      cycles_, success ? "true" : "false", error * 1000.0, (now() - cycle_start_).seconds(),
+      swivel_ * 180.0 / M_PI, grasp_offset_ * 1000.0);
     std_msgs::msg::String result;
     result.data = json;
     result_pub_->publish(result);
@@ -735,7 +814,7 @@ private:
 
   // ======================= Motion helpers =======================
 
-  bool go_to(const Eigen::Isometry3d & target, double max_speed)
+  bool go_to(const Eigen::Isometry3d & target, double max_speed, double tolerance = 0.002)
   {
     const Eigen::Isometry3d hand = current_hand_pose();
 
@@ -743,7 +822,7 @@ private:
     const Eigen::AngleAxisd rotation_diff(target.linear() * hand.linear().transpose());
     const Eigen::Vector3d rotation_error = rotation_diff.angle() * rotation_diff.axis();
 
-    if (position_error.norm() < 0.002 && rotation_diff.angle() < 0.017) {
+    if (position_error.norm() < tolerance && rotation_diff.angle() < 0.017) {
       stop();
       return true;
     }
@@ -791,12 +870,63 @@ private:
     command_gripper(std::max(target, 0.0));
   }
 
+  // One finger during probing: move its target inwards until it touches the cube,
+  // then keep the target where the finger stopped.
+  void probe_finger(
+    double position, double effort, double & target, bool & touched, double & touch_position)
+  {
+    if (touched) {
+      return;
+    }
+    // Touch = the finger feels a force, or it is stuck behind its moving target.
+    // The force is ignored for a moment after the start, while the finger accelerates.
+    const bool force_contact =
+      seconds_in_state() > 0.3 && std::isfinite(effort) && std::abs(effort) > contact_force_;
+    const bool blocked = position - target > contact_lag_;
+    if (force_contact || blocked) {
+      touched = true;
+      touch_position = position;
+      target = position;
+      RCLCPP_INFO(
+        get_logger(), "Finger touched at %.1f mm (force %.2f N%s)", position * 1000.0, effort,
+        blocked && !force_contact ? ", detected by position" : "");
+      return;
+    }
+    target = std::max(0.0, target - probe_speed_ * 0.02);  // 20 ms timer period
+  }
+
   // Same target for both fingers
   void command_gripper(double finger_position)
   {
+    command_fingers(finger_position, finger_position);
+  }
+
+  // Separate target for each finger
+  void command_fingers(double finger1, double finger2)
+  {
     std_msgs::msg::Float64MultiArray msg;
-    msg.data = {finger_position, finger_position};
+    msg.data = {finger1, finger2};
     gripper_pub_->publish(msg);
+  }
+
+  // A new arm posture for this cycle. The hand path does not change, only the elbow.
+  void choose_swivel()
+  {
+    if (randomize_) {
+      std::uniform_real_distribution<double> swivel(-swivel_range_, swivel_range_);
+      swivel_ = swivel(rng_);
+    } else {
+      swivel_ = 0.0;
+    }
+    RCLCPP_INFO(get_logger(), "Elbow swivel for this cycle: %.0f deg", swivel_ * 180.0 / M_PI);
+  }
+
+  // Sent every tick, so the controller gets it even if it starts later than this node
+  void publish_swivel()
+  {
+    std_msgs::msg::Float64 msg;
+    msg.data = swivel_;
+    swivel_pub_->publish(msg);
   }
 
   // Sent every cycle, so the servo gets it even if it starts later than this node
@@ -824,10 +954,17 @@ private:
   double open_width_;
   double squeeze_time_;
   double grip_squeeze_;
+  double probe_speed_;
+  double contact_force_;
+  double contact_lag_;
+  double centre_tolerance_;
+  int max_recentring_;
   double observe_time_;
   int min_samples_;
   bool loop_;
   bool randomize_;
+  double swivel_range_;
+  double swivel_ = 0.0;
   double min_separation_;
   double success_tolerance_;
 
@@ -841,6 +978,19 @@ private:
   bool servo_enabled_ = false;
   bool holding_cube_ = false;
   bool has_place_ = false;
+
+  // Probing grasp
+  double effort1_ = NAN;
+  double effort2_ = NAN;
+  double probe_target1_ = 0.0;
+  double probe_target2_ = 0.0;
+  bool touched1_ = false;
+  bool touched2_ = false;
+  double touch1_ = 0.0;
+  double touch2_ = 0.0;
+  int recentrings_ = 0;
+  double grasp_offset_ = 0.0;
+  Eigen::Isometry3d recentre_pose_ = Eigen::Isometry3d::Identity();
 
   // Inputs
   bool has_cube_ = false;
@@ -889,6 +1039,7 @@ private:
   rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr twist_pub_;
   rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr gripper_pub_;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr servo_enable_pub_;
+  rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr swivel_pub_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr result_pub_;
   rclcpp::Client<SetEntityPose>::SharedPtr set_pose_client_;
   rclcpp::TimerBase::SharedPtr timer_;

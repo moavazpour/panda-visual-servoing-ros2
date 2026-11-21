@@ -54,7 +54,7 @@ class BenchmarkRecorder(Node):
         self.writer.writerow([
             'cycle', 'reported_success', 'true_success', 'estimated_error_mm',
             'true_error_mm', 'true_error_x_mm', 'true_error_y_mm', 'true_yaw_error_deg',
-            'duration_s'])
+            'duration_s', 'swivel_deg', 'grasp_offset_mm'])
 
         self.get_logger().info(f'Writing benchmark results to {self.path}')
 
@@ -92,7 +92,8 @@ class BenchmarkRecorder(Node):
 
         self.writer.writerow([
             result['cycle'], result['success'], on_shelf, result['estimated_error_mm'],
-            f'{error:.2f}', f'{dx:.2f}', f'{dy:.2f}', f'{yaw_error:.2f}', result['duration_s']])
+            f'{error:.2f}', f'{dx:.2f}', f'{dy:.2f}', f'{yaw_error:.2f}', result['duration_s'],
+            result.get('swivel_deg', ''), result.get('grasp_offset_mm', '')])
         self.file.flush()
 
         self.get_logger().info(

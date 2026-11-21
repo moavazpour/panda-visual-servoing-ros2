@@ -6,6 +6,7 @@
 #include "geometry_msgs/msg/twist.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "sensor_msgs/msg/joint_state.hpp"
+#include "std_msgs/msg/float64.hpp"
 #include "std_msgs/msg/float64_multi_array.hpp"
 #include "std_msgs/msg/string.hpp"
 
@@ -27,6 +28,14 @@ public:
     // Anti-windup: how far the internal target may run ahead of the real hand [m]
     max_position_lead_ = declare_parameter("max_position_lead", 0.01);
 
+    // Null space, 2nd task: preferred posture. The elbow swivel moves joint 3 away from home,
+    // and this weight makes joint 3 matter more than the others.
+    swivel_weight_ = declare_parameter("swivel_weight", 4.0);
+
+    // Null space, safety: keep the elbow above the table, the cube and the shelf
+    elbow_min_height_ = declare_parameter("elbow_min_height", 0.35);  // [m]
+    elbow_gain_ = declare_parameter("elbow_gain", 20.0);
+
     auto latched_qos = rclcpp::QoS(1).transient_local();
     description_sub_ = create_subscription<std_msgs::msg::String>(
       "/robot_description", latched_qos,
@@ -39,6 +48,10 @@ public:
     twist_sub_ = create_subscription<geometry_msgs::msg::Twist>(
       "/target_twist", 10,
       [this](const geometry_msgs::msg::Twist & msg) {on_twist(msg);});
+
+    swivel_sub_ = create_subscription<std_msgs::msg::Float64>(
+      "/elbow_swivel", 10,
+      [this](const std_msgs::msg::Float64 & msg) {swivel_ = msg.data;});
 
     command_pub_ = create_publisher<std_msgs::msg::Float64MultiArray>(
       "/velocity_controller/commands", 10);
@@ -53,6 +66,11 @@ private:
   {
     if (!kinematics_.init(msg.data, "panda_link0", "panda_hand")) {
       RCLCPP_ERROR(get_logger(), "Could not build the kinematic chain");
+      return;
+    }
+    // Second chain, base to elbow, to know where the elbow is
+    if (!elbow_kinematics_.init(msg.data, "panda_link0", "panda_link4")) {
+      RCLCPP_ERROR(get_logger(), "Could not build the elbow chain");
       return;
     }
     const auto n = kinematics_.num_joints();
@@ -161,7 +179,7 @@ private:
     // 7. Secondary task with an exact null-space projector
     const Eigen::MatrixXd J_pinv_exact = J.completeOrthogonalDecomposition().pseudoInverse();
     const Eigen::MatrixXd N = Eigen::MatrixXd::Identity(n, n) - J_pinv_exact * J;
-    qdot += N * (nullspace_gain_ * (q_home_ - q_));
+    qdot += N * nullspace_velocity();
 
     // 8. Speed limit, all joints scaled together
     const double fastest = qdot.cwiseAbs().maxCoeff();
@@ -170,6 +188,39 @@ private:
     }
 
     publish(qdot);
+  }
+
+  // What the arm should do with its spare degree of freedom.
+  // The projector N removes everything that would move the hand.
+  Eigen::VectorXd nullspace_velocity()
+  {
+    const auto n = kinematics_.num_joints();
+
+    // a) Preferred posture: home, with joint 3 turned by the requested swivel
+    Eigen::VectorXd q_preferred = q_home_;
+    q_preferred(2) += swivel_;
+    Eigen::VectorXd weights = Eigen::VectorXd::Ones(n);
+    weights(2) = swivel_weight_;
+    Eigen::VectorXd velocity = nullspace_gain_ * weights.cwiseProduct(q_preferred - q_);
+
+    // b) Safety: if the elbow is too low, push it up.
+    //    The elbow chain has only the first 4 joints; the others do not move the elbow.
+    const auto m = elbow_kinematics_.num_joints();
+    Eigen::Isometry3d elbow;
+    Eigen::MatrixXd J_elbow;
+    if (elbow_kinematics_.forward(q_.head(m), elbow) &&
+      elbow_kinematics_.jacobian(q_.head(m), J_elbow))
+    {
+      const double too_low = elbow_min_height_ - elbow.translation().z();
+      if (too_low > 0.0) {
+        // Row 2 of the Jacobian: how each joint moves the elbow up or down
+        velocity.head(m) += elbow_gain_ * too_low * J_elbow.row(2).transpose();
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 2000, "Elbow low (%.2f m), lifting it",
+          elbow.translation().z());
+      }
+    }
+    return velocity;
   }
 
   void publish(const Eigen::VectorXd & qdot)
@@ -187,9 +238,14 @@ private:
   double nullspace_gain_;
   double command_timeout_;
   double max_position_lead_;
+  double swivel_weight_;
+  double elbow_min_height_;
+  double elbow_gain_;
   
   // State
   arm_vs_control::Kinematics kinematics_;
+  arm_vs_control::Kinematics elbow_kinematics_;
+  double swivel_ = 0.0;
   Eigen::VectorXd q_;
   Eigen::VectorXd q_home_;
   Eigen::Matrix<double, 6, 1> twist_ = Eigen::Matrix<double, 6, 1>::Zero();
@@ -204,6 +260,7 @@ private:
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr description_sub_;
   rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr joint_sub_;
   rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr twist_sub_;
+  rclcpp::Subscription<std_msgs::msg::Float64>::SharedPtr swivel_sub_;
   rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr command_pub_;
   rclcpp::TimerBase::SharedPtr timer_;
 };

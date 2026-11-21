@@ -80,6 +80,8 @@
         <param name="initial_value">0.04</param>
       </state_interface>
       <state_interface name="velocity"/>
+      <!-- Force on the finger, used to feel when it touches the cube -->
+      <state_interface name="effort"/>
     </joint>
   </xacro:macro>
 

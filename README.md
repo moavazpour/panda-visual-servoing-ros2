@@ -9,6 +9,8 @@ simulator's ground truth.
 
 Written from scratch in C++ on ROS 2 Jazzy and Gazebo Harmonic, without MoveIt.
 
+![Demo](docs/demo.gif)
+
 ## Highlights
 
 - **Marker pose estimation** with OpenCV ArUco: subpixel corners, `SOLVEPNP_IPPE_SQUARE`,
@@ -20,8 +22,12 @@ Written from scratch in C++ on ROS 2 Jazzy and Gazebo Harmonic, without MoveIt.
   near its home posture, and closed-loop pose feedback with anti-windup
 - **Pick-and-place state machine** with contact detection, a two-step place localization
   (coarse, then close-up) and a camera check of the result
-- **Software-coupled gripper**: both fingers are driven towards a shared target, which keeps
-  the cube centred like the gear in the real Franka Hand
+- **Probing grasp**: the fingers close slowly and stop when they feel the cube, so it is not
+  pushed; the measured offset re-centres the hand before the final grip. While carrying, both
+  fingers share one target, which keeps the cube centred like the gear in the real Franka Hand
+- **Using the 7th joint**: every cycle picks a random elbow swivel in the null space of the
+  hand task, so the arm reaches the same poses with a different posture, while a second
+  null-space term keeps the elbow above the table and the shelf
 - **Randomized experiments**: the cube and the shelf are moved to random poses through the
   Gazebo service API before every cycle
 - **Ground-truth benchmark**: a recorder node compares the result with Gazebo's true poses
@@ -29,31 +35,36 @@ Written from scratch in C++ on ROS 2 Jazzy and Gazebo Harmonic, without MoveIt.
 
 ## Results
 
-60 consecutive cycles with random cube and shelf poses. The error is the horizontal distance
+75 consecutive cycles with random cube and shelf poses. The error is the horizontal distance
 between the cube centre and the shelf centre, taken from Gazebo's ground truth.
 
 | Metric | Value |
 |---|---|
-| Placement error, mean ± std | 1.2 ± 1.0 mm |
-| Placement error, median / p95 / max | 1.0 / 3.6 / 4.2 mm |
-| Yaw error, median / p95 | 0.5° / 9.9° |
-| Cycle time, mean | 45 s |
-| Success rate (cube standing on the shelf) | 42 / 60 (70 %) |
+| Placement error, mean ± std | 1.2 ± 0.9 mm |
+| Placement error, median / p95 / max | 1.0 / 2.7 / 5.3 mm |
+| Yaw error, median / p95 | 0.5° / 0.9° |
+| Robot's own error estimate vs ground truth | 0.1 mm mean difference |
+| Cycle time, mean | 49 s |
+| Success rate (cube standing on the shelf) | 67 / 75 (89 %) |
 
 ![Benchmark](docs/benchmark.png)
 
 The right plot compares the error the robot measures with its own camera against the truth.
-The robot overestimated its error by about 3 mm because the shelf and the placed cube were
-seen from different viewpoints; the verification step now looks at the cube from the same
-distance as the shelf marker, so the camera's depth error cancels out.
+The robot looks at the placed cube from the same distance it measured the shelf marker from,
+so the camera's depth error is the same in both measurements and cancels out. Without a
+ground truth, as on a real robot, its own report can be trusted.
 
-### How the benchmark found the gripper problem
+Of the 8 failed cycles, 5 did not see the shelf marker from the overview pose, and in 3 the
+gripper closed to 78 mm, wider than the cube, and the cube did not end up on the shelf.
 
-| Version | Gripper | Placement error | Success |
+### How the benchmark guided the development
+
+| Version | Change | Placement error | Success |
 |---|---|---|---|
 | A | `mimic` joint for the second finger | bimodal: the second finger did not follow reliably | – |
 | B | independent fingers, both pushing with full force | 15.3 ± 0.5 mm | 73 % |
-| C | fingers coupled in software, cube kept centred | **1.2 ± 1.0 mm** | 70 % |
+| C | fingers coupled in software, cube kept centred | 1.2 ± 1.0 mm | 70 % |
+| D | shelf measured before the pick, layouts kept in view, verification from the shelf viewpoint | **1.2 ± 0.9 mm** | **89 %** |
 
 The physics engine ignores `mimic` joints. With two independent fingers that both push with
 their maximum force, nothing pulls the cube back to the centre, so it slid against one
@@ -61,6 +72,11 @@ finger while being carried. The constant 15 mm offset in version B, with only 0.
 pointed at a mechanical cause rather than perception. Version C drives both fingers to the
 same target just inside their average position: if the cube moves towards one finger, that
 finger pushes harder and the other one backs off.
+
+The failure log of version C showed three separate causes, all fixed in D: the cube was
+sometimes out of the camera view at the far end of the random area, the cube in the hand
+hid the shelf marker, and the final check saw the cube from a different distance than the
+shelf, which made the robot overestimate its own error by about 3 mm.
 
 ## How it works
 

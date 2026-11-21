@@ -27,6 +27,9 @@ def main():
     print(f'Position error:       {describe(placed["true_error_mm"], "mm")}')
     print(f'Yaw error (absolute): {describe(placed["true_yaw_error_deg"].abs(), "deg")}')
     print(f'Cycle time:           {describe(df["duration_s"], "s")}')
+    if 'grasp_offset_mm' in df and df['grasp_offset_mm'].notna().any():
+        # How far the hand was from the cube centre before the probing grasp corrected it
+        print(f'Grasp offset (abs):   {describe(df["grasp_offset_mm"].abs(), "mm")}')
 
     # How well does the robot's own camera measurement match the truth?
     gap = (placed['estimated_error_mm'] - placed['true_error_mm']).abs()
